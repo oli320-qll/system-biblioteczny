@@ -1,0 +1,1140 @@
+import datetime
+import sqlite3
+import tkinter as tk
+from tkinter import messagebox, ttk
+
+
+# --- BAZA DANYCH ---
+def zainicjalizuj_baze():
+  conn = sqlite3.connect("biblioteka_nowa.db")
+  cursor = conn.cursor()
+
+  # Tabela książek
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Books (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            author TEXT NOT NULL,
+            genre TEXT,
+            barcode TEXT,
+            available_copies INTEGER NOT NULL
+        )
+    """)
+
+  # Tabela czytelników (użytkowników)
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            barcode TEXT UNIQUE
+        )
+    """)
+
+  # Bezpieczna migracja dla starszych baz danych (dodanie kolumny barcode, jeśli jej brakuje)
+  cursor.execute("PRAGMA table_info(Users)")
+  kolumny_users = [k[1] for k in cursor.fetchall()]
+  if "barcode" not in kolumny_users:
+    try:
+      cursor.execute("ALTER TABLE Users ADD COLUMN barcode TEXT UNIQUE")
+    except sqlite3.OperationalError:
+      pass
+
+  # Tabela wypożyczeń
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Loans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            book_id INTEGER,
+            user_id INTEGER,
+            borrow_date TEXT,
+            due_date TEXT,
+            FOREIGN KEY (book_id) REFERENCES Books(id),
+            FOREIGN KEY (user_id) REFERENCES Users(id)
+        )
+    """)
+
+  # Tabela ustawień
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+  cursor.execute(
+      "INSERT OR IGNORE INTO Settings (key, value) VALUES ('loan_days', '14')"
+  )
+
+  conn.commit()
+  conn.close()
+
+
+def pobierz_ustawienie(klucz):
+  conn = sqlite3.connect("biblioteka.db")
+  cursor = conn.cursor()
+  cursor.execute("SELECT value FROM Settings WHERE key = ?", (klucz,))
+  wynik = cursor.fetchone()
+  conn.close()
+  return wynik[0] if wynik else "14"
+
+
+def zapisz_ustawienie(klucz, wartosc):
+  conn = sqlite3.connect("biblioteka.db")
+  cursor = conn.cursor()
+  cursor.execute(
+      "INSERT OR REPLACE INTO Settings (key, value) VALUES (?, ?)",
+      (klucz, wartosc),
+  )
+  conn.commit()
+  conn.close()
+
+
+# --- OKNO LOGOWANIA (PEŁNY EKRAN) ---
+class OknoLogowania:
+
+  def __init__(self, root):
+    self.root = root
+    self.root.title("Logowanie - System Biblioteczny")
+    self.root.attributes("-fullscreen", True)
+
+    zainicjalizuj_baze()
+
+    rama_glowna = tk.Frame(root)
+    rama_glowna.place(relx=0.5, rely=0.5, anchor="center")
+
+    tk.Label(
+        rama_glowna,
+        text="📚 System Biblioteczny Pro+",
+        font=("Arial", 22, "bold"),
+        fg="#2196F3",
+    ).pack(pady=20)
+    tk.Label(
+        rama_glowna,
+        text="Zeskanuj kod kreskowy lub wpisz swój identyfikator:",
+        font=("Arial", 12),
+    ).pack(pady=5)
+
+    self.entry_kod = tk.Entry(
+        rama_glowna, width=30, font=("Arial", 16), justify="center"
+    )
+    self.entry_kod.pack(pady=15)
+    self.entry_kod.focus()
+    self.entry_kod.bind("<Return>", lambda e: self.zaloguj())
+
+    btn_login = tk.Button(
+        rama_glowna,
+        text="Zaloguj się",
+        bg="#4CAF50",
+        fg="white",
+        font=("Arial", 12, "bold"),
+        width=20,
+        command=self.zaloguj,
+    )
+    btn_login.pack(pady=10)
+
+    btn_wyjscie = tk.Button(
+        rama_glowna,
+        text="Zamknij program",
+        bg="#F44336",
+        fg="white",
+        font=("Arial", 10),
+        width=15,
+        command=root.destroy,
+    )
+    btn_wyjscie.pack(pady=20)
+
+    root.bind("<Escape>", lambda e: root.attributes("-fullscreen", False))
+
+  def zaloguj(self):
+    kod = self.entry_kod.get().strip()
+
+    if not kod:
+      messagebox.showerror("Błąd", "Wpisz lub zeskanuj kod kreskowy!")
+      return
+
+    if kod == "admin":
+      self.root.destroy()
+      start_glownej_aplikacji("Administrator", "admin")
+      return
+
+    conn = sqlite3.connect("biblioteka.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, name FROM Users WHERE barcode = ? OR id = ?", (kod, kod)
+    )
+    uzytkownik = cursor.fetchone()
+    conn.close()
+
+    if uzytkownik:
+      user_id, user_name = uzytkownik
+      self.root.destroy()
+      start_glownej_aplikacji(user_name, user_id)
+    else:
+      messagebox.showerror(
+          "Błąd logowania",
+          "Nie znaleziono użytkownika o takim kodzie kreskowym lub ID!",
+      )
+      self.entry_kod.delete(0, tk.END)
+
+
+# --- GŁÓWNA APLIKACJA (PEŁNY EKRAN) ---
+class AplikacjaBiblioteka:
+
+  def __init__(self, root, nazwa_uzytkownika, id_uzytkownika):
+    self.root = root
+    self.nazwa_uzytkownika = nazwa_uzytkownika
+    self.id_uzytkownika = id_uzytkownika
+
+    self.root.title(
+        f"System Biblioteczny Pro+ (Zalogowany: {nazwa_uzytkownika})"
+    )
+    self.root.attributes("-fullscreen", True)
+
+    pasek_uzytkownika = tk.Frame(root, bg="#ECEFF1", pady=5)
+    pasek_uzytkownika.pack(fill="x")
+    tk.Label(
+        pasek_uzytkownika,
+        text=(
+            f"👤 Zalogowany: {nazwa_uzytkownika} "
+            f"({'Administrator' if str(id_uzytkownika) == 'admin' else 'Czytelnik'})"
+        ),
+        bg="#ECEFF1",
+        font=("Arial", 10, "bold"),
+    ).pack(side="left", padx=10)
+
+    btn_wyloguj = tk.Button(
+        pasek_uzytkownika,
+        text="Wyloguj",
+        bg="#F44336",
+        fg="white",
+        font=("Arial", 9, "bold"),
+        command=self.wyloguj,
+    )
+    btn_wyloguj.pack(side="right", padx=10)
+
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True, padx=10, pady=10)
+
+    self.zakladka_ksiazki = ttk.Frame(notebook)
+    self.zakladka_czytelnicy = ttk.Frame(notebook)
+    self.zakladka_wypozyczenia = ttk.Frame(notebook)
+    self.zakladka_ustawienia = ttk.Frame(notebook)
+
+    notebook.add(self.zakladka_ksiazki, text=" 📚 Książki ")
+    notebook.add(self.zakladka_czytelnicy, text=" 👤 Użytkownicy ")
+    notebook.add(self.zakladka_wypozyczenia, text=" 🔄 Wypożyczenia ")
+    notebook.add(self.zakladka_ustawienia, text=" ⚙️ Ustawienia ")
+
+    self.zbuduj_widok_ksiazek()
+    self.zbuduj_widok_czytelnikow()
+    self.zbuduj_widok_wypozyczen()
+    self.zbuduj_widok_ustawien()
+
+    root.bind("<Escape>", lambda e: root.attributes("-fullscreen", False))
+
+  def wyloguj(self):
+    self.root.destroy()
+    root_logowania = tk.Tk()
+    OknoLogowania(root_logowania)
+    root_logowania.mainloop()
+
+  # ==================== 1. ZAKŁADKA: KSIĄŻKI ====================
+  def zbuduj_widok_ksiazek(self):
+    if str(self.id_uzytkownika) == "admin":
+      rama_dodawania = tk.LabelFrame(
+          self.zakladka_ksiazki,
+          text=" Dodaj nową książkę ",
+          font=("Arial", 10, "bold"),
+      )
+      rama_dodawania.pack(fill="x", padx=10, pady=5)
+
+      tk.Label(rama_dodawania, text="Tytuł:").pack(anchor="w", padx=5)
+      self.entry_tytul = tk.Entry(rama_dodawania, width=50)
+      self.entry_tytul.pack(padx=5, pady=2)
+
+      tk.Label(rama_dodawania, text="Autor:").pack(anchor="w", padx=5)
+      self.entry_autor = tk.Entry(rama_dodawania, width=50)
+      self.entry_autor.pack(padx=5, pady=2)
+
+      tk.Label(rama_dodawania, text="Gatunek:").pack(anchor="w", padx=5)
+      self.entry_gatunek = tk.Entry(rama_dodawania, width=50)
+      self.entry_gatunek.pack(padx=5, pady=2)
+
+      tk.Label(rama_dodawania, text="Kod kreskowy:").pack(anchor="w", padx=5)
+      self.entry_kod_ksiazki = tk.Entry(rama_dodawania, width=50)
+      self.entry_kod_ksiazki.pack(padx=5, pady=2)
+
+      tk.Label(rama_dodawania, text="Liczba egzemplarzy:").pack(anchor="w", padx=5)
+      self.entry_sztuki = tk.Entry(rama_dodawania, width=50)
+      self.entry_sztuki.pack(padx=5, pady=2)
+
+      btn_dodaj = tk.Button(
+          rama_dodawania,
+          text="Dodaj książkę",
+          bg="#4CAF50",
+          fg="white",
+          font=("Arial", 10, "bold"),
+          command=self.dodaj_ksiazke,
+      )
+      btn_dodaj.pack(pady=8)
+
+    rama_szukaj = tk.LabelFrame(
+        self.zakladka_ksiazki,
+        text=" 🔍 Wyszukiwarka książek ",
+        font=("Arial", 10, "bold"),
+    )
+    rama_szukaj.pack(fill="x", padx=10, pady=5)
+
+    self.entry_szukaj_ksiazki = tk.Entry(rama_szukaj, width=50)
+    self.entry_szukaj_ksiazki.pack(side="left", padx=5, pady=5)
+    self.entry_szukaj_ksiazki.bind(
+        "<KeyRelease>", lambda e: self.odswiez_ksiazki()
+    )
+
+    btn_czysc_szukanie = tk.Button(
+        rama_szukaj, text="Wyczyść", command=self.wyczysc_szukanie_ksiazek
+    )
+    btn_czysc_szukanie.pack(side="left", padx=5)
+
+    rama_lista = tk.LabelFrame(
+        self.zakladka_ksiazki, text=" Katalog książek ", font=("Arial", 10, "bold")
+    )
+    rama_lista.pack(fill="both", expand=True, padx=10, pady=5)
+
+    self.tabela_ksiazek = ttk.Treeview(
+        rama_lista,
+        columns=("ID", "Tytuł", "Autor", "Gatunek", "Kod", "Sztuki"),
+        show="headings",
+    )
+    self.tabela_ksiazek.heading("ID", text="ID")
+    self.tabela_ksiazek.heading("Tytuł", text="Tytuł")
+    self.tabela_ksiazek.heading("Autor", text="Autor")
+    self.tabela_ksiazek.heading("Gatunek", text="Gatunek")
+    self.tabela_ksiazek.heading("Kod", text="Kod")
+    self.tabela_ksiazek.heading("Sztuki", text="Stan")
+
+    self.tabela_ksiazek.column("ID", width=40, anchor="center")
+    self.tabela_ksiazek.column("Tytuł", width=300)
+    self.tabela_ksiazek.column("Autor", width=250)
+    self.tabela_ksiazek.column("Gatunek", width=150)
+    self.tabela_ksiazek.column("Kod", width=120, anchor="center")
+    self.tabela_ksiazek.column("Sztuki", width=70, anchor="center")
+    self.tabela_ksiazek.pack(fill="both", expand=True, padx=5, pady=5)
+
+    if str(self.id_uzytkownika) == "admin":
+      rama_przyciski_ksiazki = tk.Frame(self.zakladka_ksiazki)
+      rama_przyciski_ksiazki.pack(pady=10)
+
+      btn_wypozycz = tk.Button(
+          rama_przyciski_ksiazki,
+          text="Wypożycz zaznaczoną książkę",
+          bg="#2196F3",
+          fg="white",
+          font=("Arial", 10, "bold"),
+          command=self.otworz_okno_wypozyczenia,
+      )
+      btn_wypozycz.pack(side="left", padx=5)
+
+      btn_usun_ksiazke = tk.Button(
+          rama_przyciski_ksiazki,
+          text="Usuń zaznaczoną książkę",
+          bg="#F44336",
+          fg="white",
+          font=("Arial", 10, "bold"),
+          command=self.usun_ksiazke,
+      )
+      btn_usun_ksiazke.pack(side="left", padx=5)
+
+    self.odswiez_ksiazki()
+
+  # ==================== 2. ZAKŁADKA: UŻYTKOWNICY ====================
+  def zbuduj_widok_czytelnikow(self):
+    if str(self.id_uzytkownika) == "admin":
+      rama_dodawania_uzyt = tk.LabelFrame(
+          self.zakladka_czytelnicy,
+          text=" Zarządzanie użytkownikami (Dodaj / Edytuj) ",
+          font=("Arial", 10, "bold"),
+      )
+      rama_dodawania_uzyt.pack(fill="x", padx=10, pady=5)
+
+      tk.Label(rama_dodawania_uzyt, text="Imię i nazwisko:").pack(
+          anchor="w", padx=5
+      )
+      self.entry_nazwa_czytelnika = tk.Entry(rama_dodawania_uzyt, width=50)
+      self.entry_nazwa_czytelnika.pack(padx=5, pady=2)
+
+      tk.Label(rama_dodawania_uzyt, text="Kod kreskowy / Login:").pack(
+          anchor="w", padx=5
+      )
+      self.entry_kod_czytelnika_form = tk.Entry(rama_dodawania_uzyt, width=50)
+      self.entry_kod_czytelnika_form.pack(padx=5, pady=2)
+
+      rame_btn_uzyt = tk.Frame(rama_dodawania_uzyt)
+      rame_btn_uzyt.pack(pady=8)
+
+      btn_dodaj_uzyt = tk.Button(
+          rame_btn_uzyt,
+          text="Dodaj nowego",
+          bg="#4CAF50",
+          fg="white",
+          font=("Arial", 10, "bold"),
+          command=self.dodaj_czytelnika,
+      )
+      btn_dodaj_uzyt.pack(side="left", padx=5)
+
+      btn_zapisz_edycje = tk.Button(
+          rame_btn_uzyt,
+          text="Zapisz zmiany",
+          bg="#FF9800",
+          fg="white",
+          font=("Arial", 10, "bold"),
+          command=self.zapisz_edycje_czytelnika,
+      )
+      btn_zapisz_edycje.pack(side="left", padx=5)
+
+      btn_usun_uzyt = tk.Button(
+          rame_btn_uzyt,
+          text="Usuń użytkownika",
+          bg="#F44336",
+          fg="white",
+          font=("Arial", 10, "bold"),
+          command=self.usun_czytelnika,
+      )
+      btn_usun_uzyt.pack(side="left", padx=5)
+
+    rama_szukaj_uzyt = tk.LabelFrame(
+        self.zakladka_czytelnicy,
+        text=" 🔍 Wyszukiwarka użytkowników ",
+        font=("Arial", 10, "bold"),
+    )
+    rama_szukaj_uzyt.pack(fill="x", padx=10, pady=5)
+
+    self.entry_szukaj_czytelnika = tk.Entry(rama_szukaj_uzyt, width=50)
+    self.entry_szukaj_czytelnika.pack(side="left", padx=5, pady=5)
+    self.entry_szukaj_czytelnika.bind(
+        "<KeyRelease>", lambda e: self.odswiez_czytelnikow()
+    )
+
+    btn_czysc_szukanie_uzyt = tk.Button(
+        rama_szukaj_uzyt, text="Wyczyść", command=self.wyczysc_szukanie_czytelnikow
+    )
+    btn_czysc_szukanie_uzyt.pack(side="left", padx=5)
+
+    rama_lista_uzyt = tk.LabelFrame(
+        self.zakladka_czytelnicy,
+        text=(
+            " Lista użytkowników "
+            if str(self.id_uzytkownika) == "admin"
+            else " Twoje konto "
+        ),
+        font=("Arial", 10, "bold"),
+    )
+    rama_lista_uzyt.pack(fill="both", expand=True, padx=10, pady=5)
+
+    self.tabela_czytelnikow = ttk.Treeview(
+        rama_lista_uzyt,
+        columns=("ID", "Nazwa", "Kod", "Wypożyczone"),
+        show="headings",
+    )
+    self.tabela_czytelnikow.heading("ID", text="ID")
+    self.tabela_czytelnikow.heading("Nazwa", text="Imię i nazwisko")
+    self.tabela_czytelnikow.heading("Kod", text="Kod kreskowy / Login")
+    self.tabela_czytelnikow.heading("Wypożyczone", text="Aktywne wypożyczenia")
+
+    self.tabela_czytelnikow.column("ID", width=50, anchor="center")
+    self.tabela_czytelnikow.column("Nazwa", width=300)
+    self.tabela_czytelnikow.column("Kod", width=200, anchor="center")
+    self.tabela_czytelnikow.column("Wypożyczone", width=150, anchor="center")
+    self.tabela_czytelnikow.pack(fill="both", expand=True, padx=5, pady=5)
+
+    if str(self.id_uzytkownika) == "admin":
+      self.tabela_czytelnikow.bind(
+          "<ButtonRelease-1>", self.wypelnij_pola_czytelnika
+      )
+
+    btn_karta = tk.Button(
+        self.zakladka_czytelnicy,
+        text="Wyświetl szczegółową kartę / wypożyczenia",
+        bg="#9C27B0",
+        fg="white",
+        font=("Arial", 10, "bold"),
+        command=self.pokaz_karte_czytelnika,
+    )
+    btn_karta.pack(pady=10)
+
+    self.odswiez_czytelnikow()
+
+  # ==================== 3. ZAKŁADKA: WYPOŻYCZENIA ====================
+  def zbuduj_widok_wypozyczen(self):
+    rama_wyp = tk.LabelFrame(
+        self.zakladka_wypozyczenia,
+        text=(
+            " Aktywne wypożyczenia w systemie "
+            if str(self.id_uzytkownika) == "admin"
+            else " Twoje wypożyczone książki "
+        ),
+        font=("Arial", 10, "bold"),
+    )
+    rama_wyp.pack(fill="both", expand=True, padx=10, pady=10)
+
+    self.tabela_wypozyczen = ttk.Treeview(
+        rama_wyp,
+        columns=("LoanID", "Czytelnik", "Książka", "DataW", "Termin"),
+        show="headings",
+    )
+    self.tabela_wypozyczen.heading("LoanID", text="ID")
+    self.tabela_wypozyczen.heading("Czytelnik", text="Czytelnik")
+    self.tabela_wypozyczen.heading("Książka", text="Książka")
+    self.tabela_wypozyczen.heading("DataW", text="Wypożyczono")
+    self.tabela_wypozyczen.heading("Termin", text="Termin zwrotu")
+
+    self.tabela_wypozyczen.column("LoanID", width=50, anchor="center")
+    self.tabela_wypozyczen.column("Czytelnik", width=250)
+    self.tabela_wypozyczen.column("Książka", width=350)
+    self.tabela_wypozyczen.column("DataW", width=150, anchor="center")
+    self.tabela_wypozyczen.column("Termin", width=150, anchor="center")
+    self.tabela_wypozyczen.pack(fill="both", expand=True, padx=5, pady=5)
+
+    if str(self.id_uzytkownika) == "admin":
+      btn_zwrot = tk.Button(
+          self.zakladka_wypozyczenia,
+          text="Zwróć zaznaczoną książkę",
+          bg="#FF9800",
+          fg="white",
+          font=("Arial", 10, "bold"),
+          command=self.zroc_ksiazke,
+      )
+      btn_zwrot.pack(pady=10)
+
+    self.odswiez_wypozyczenia()
+
+  # ==================== 4. ZAKŁADKA: USTAWIENIA ====================
+  def zbuduj_widok_ustawien(self):
+    rama_ust = tk.LabelFrame(
+        self.zakladka_ustawienia,
+        text=" Ustawienia systemu ",
+        font=("Arial", 10, "bold"),
+    )
+    rama_ust.pack(fill="both", expand=True, padx=10, pady=10)
+
+    tk.Label(
+        rama_ust,
+        text="Domyślny czas wypożyczenia (w dniach):",
+        font=("Arial", 10),
+    ).pack(anchor="w", padx=15, pady=5)
+    self.entry_dni = tk.Entry(rama_ust, width=20)
+    self.entry_dni.pack(anchor="w", padx=15, pady=2)
+    self.entry_dni.insert(0, pobierz_ustawienie("loan_days"))
+
+    if str(self.id_uzytkownika) == "admin":
+      btn_zapisz_ust = tk.Button(
+          rama_ust,
+          text="Zapisz ustawienia",
+          bg="#607D8B",
+          fg="white",
+          font=("Arial", 10, "bold"),
+          command=self.zapisz_konfiguracje,
+      )
+      btn_zapisz_ust.pack(anchor="w", padx=15, pady=10)
+
+      # --- SPECJALNA SEKCJA DLA ADMINA: STATYSTYKA SYSTEMU ---
+      rama_stat = tk.LabelFrame(
+          rama_ust, text=" 📊 Statystyki systemu ", font=("Arial", 10, "bold")
+      )
+      rama_stat.pack(fill="x", padx=15, pady=15)
+
+      self.label_stat_ksiazki = tk.Label(
+          rama_stat, text="Liczba unikalnych książek: ...", font=("Arial", 10)
+      )
+      self.label_stat_ksiazki.pack(anchor="w", padx=10, pady=2)
+
+      self.label_stat_czytelnicy = tk.Label(
+          rama_stat, text="Liczba użytkowników: ...", font=("Arial", 10)
+      )
+      self.label_stat_czytelnicy.pack(anchor="w", padx=10, pady=2)
+
+      self.label_stat_wypozyczenia = tk.Label(
+          rama_stat, text="Aktywne wypożyczenia: ...", font=("Arial", 10)
+      )
+      self.label_stat_wypozyczenia.pack(anchor="w", padx=10, pady=2)
+
+      btn_odswiez_stat = tk.Button(
+          rama_stat,
+          text="Odśwież statystyki",
+          bg="#009688",
+          fg="white",
+          font=("Arial", 9, "bold"),
+          command=self.aktualizuj_statystyki,
+      )
+      btn_odswiez_stat.pack(anchor="w", padx=10, pady=8)
+
+      self.aktualizuj_statystyki()
+
+    else:
+      self.entry_dni.config(state="disabled")
+
+    info_label = tk.Label(
+        rama_ust,
+        text=(
+            f"ℹ️ Zalogowany użytkownik: {self.nazwa_uzytkownika}\n- Aby wyjść z"
+            " pełnego ekranu, naciśnij klawisz Escape."
+        ),
+        justify="left",
+        fg="gray",
+        font=("Arial", 10),
+    )
+    info_label.pack(anchor="w", padx=15, pady=15)
+
+  def aktualizuj_statystyki(self):
+    conn = sqlite3.connect("biblioteka.db")
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(*) FROM Books")
+    liczba_ksiazek = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM Users")
+    liczba_czytelnikow = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM Loans")
+    liczba_wypozyczen = cursor.fetchone()[0]
+
+    conn.close()
+
+    self.label_stat_ksiazki.config(
+        text=f"Liczba unikalnych książek: {liczba_ksiazek}"
+    )
+    self.label_stat_czytelnicy.config(
+        text=f"Liczba użytkowników: {liczba_czytelnikow}"
+    )
+    self.label_stat_wypozyczenia.config(
+        text=f"Aktywne wypożyczenia: {liczba_wypozyczen}"
+    )
+
+  def zapisz_konfiguracje(self):
+    dni = self.entry_dni.get().strip()
+    if not dni.isdigit():
+      messagebox.showerror("Błąd", "Liczba dni musi być wartością całkowitą!")
+      return
+    zapisz_ustawienie("loan_days", dni)
+    messagebox.showinfo("Sukces", "Zapisano ustawienia systemowe!")
+
+  # ==================== FUNKCJE BIZNESOWE ====================
+  def odswiez_ksiazki(self):
+    for row in self.tabela_ksiazek.get_children():
+      self.tabela_ksiazek.delete(row)
+
+    szukaj = self.entry_szukaj_ksiazki.get().strip()
+    conn = sqlite3.connect("biblioteka.db")
+    cursor = conn.cursor()
+
+    if szukaj:
+      cursor.execute(
+          """
+                SELECT * FROM Books 
+                WHERE title LIKE ? OR author LIKE ? OR genre LIKE ? OR barcode LIKE ?
+            """,
+          (f"%{szukaj}%", f"%{szukaj}%", f"%{szukaj}%", f"%{szukaj}%"),
+      )
+    else:
+      cursor.execute("SELECT * FROM Books")
+
+    for k in cursor.fetchall():
+      self.tabela_ksiazek.insert(
+          "", "end", values=(k[0], k[1], k[2], k[3], k[4], k[5])
+      )
+    conn.close()
+
+  def wyczysc_szukanie_ksiazek(self):
+    self.entry_szukaj_ksiazki.delete(0, tk.END)
+    self.odswiez_ksiazki()
+
+  def odswiez_czytelnikow(self):
+    for row in self.tabela_czytelnikow.get_children():
+      self.tabela_czytelnikow.delete(row)
+
+    szukaj = self.entry_szukaj_czytelnika.get().strip()
+    conn = sqlite3.connect("biblioteka.db")
+    cursor = conn.cursor()
+
+    if str(self.id_uzytkownika) != "admin":
+      cursor.execute(
+          """
+                SELECT Users.id, Users.name, Users.barcode, COUNT(Loans.id) 
+                FROM Users 
+                LEFT JOIN Loans ON Users.id = Loans.user_id 
+                WHERE Users.id = ?
+                GROUP BY Users.id
+            """,
+          (self.id_uzytkownika,),
+      )
+    else:
+      if szukaj:
+        cursor.execute(
+            """
+                    SELECT Users.id, Users.name, Users.barcode, COUNT(Loans.id) 
+                    FROM Users 
+                    LEFT JOIN Loans ON Users.id = Loans.user_id 
+                    WHERE Users.name LIKE ? OR Users.barcode LIKE ?
+                    GROUP BY Users.id
+                """,
+            (f"%{szukaj}%", f"%{szukaj}%"),
+        )
+      else:
+        cursor.execute("""
+                    SELECT Users.id, Users.name, Users.barcode, COUNT(Loans.id) 
+                    FROM Users 
+                    LEFT JOIN Loans ON Users.id = Loans.user_id 
+                    GROUP BY Users.id
+                """)
+
+    for u in cursor.fetchall():
+      self.tabela_czytelnikow.insert(
+          "", "end", values=(u[0], u[1], u[2] if u[2] else "-", u[3])
+      )
+    conn.close()
+
+  def wyczysc_szukanie_czytelnikow(self):
+    self.entry_szukaj_czytelnika.delete(0, tk.END)
+    self.odswiez_czytelnikow()
+
+  def odswiez_wypozyczenia(self):
+    for row in self.tabela_wypozyczen.get_children():
+      self.tabela_wypozyczen.delete(row)
+    conn = sqlite3.connect("biblioteka.db")
+    cursor = conn.cursor()
+
+    if str(self.id_uzytkownika) != "admin":
+      cursor.execute(
+          """
+                SELECT Loans.id, Users.name, Books.title, Loans.borrow_date, Loans.due_date 
+                FROM Loans 
+                JOIN Users ON Loans.user_id = Users.id 
+                JOIN Books ON Loans.book_id = Books.id
+                WHERE Loans.user_id = ?
+            """,
+          (self.id_uzytkownika,),
+      )
+    else:
+      cursor.execute("""
+            SELECT Loans.id, Users.name, Books.title, Loans.borrow_date, Loans.due_date 
+            FROM Loans 
+            JOIN Users ON Loans.user_id = Users.id 
+            JOIN Books ON Loans.book_id = Books.id
+        """)
+
+    for w in cursor.fetchall():
+      self.tabela_wypozyczen.insert("", "end", values=(w[0], w[1], w[2], w[3], w[4]))
+    conn.close()
+
+  def dodaj_ksiazke(self):
+    tytul = self.entry_tytul.get()
+    autor = self.entry_autor.get()
+    gatunek = self.entry_gatunek.get()
+    kod = self.entry_kod_ksiazki.get()
+    sztuki_str = self.entry_sztuki.get()
+
+    if not tytul or not autor or not sztuki_str:
+      messagebox.showerror("Błąd", "Wypełnij przynajmniej tytuł, autora i stan!")
+      return
+
+    try:
+      sztuki = int(sztuki_str)
+    except ValueError:
+      messagebox.showerror("Błąd", "Liczba egzemplarzy musi być liczbą!")
+      return
+
+    conn = sqlite3.connect("biblioteka.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+            INSERT INTO Books (title, author, genre, barcode, available_copies) 
+            VALUES (?, ?, ?, ?, ?)
+        """,
+        (tytul, autor, gatunek, kod, sztuki),
+    )
+    conn.commit()
+    conn.close()
+
+    self.entry_tytul.delete(0, tk.END)
+    self.entry_autor.delete(0, tk.END)
+    self.entry_gatunek.delete(0, tk.END)
+    self.entry_kod_ksiazki.delete(0, tk.END)
+    self.entry_sztuki.delete(0, tk.END)
+
+    messagebox.showinfo("Sukces", "Dodano książkę do bazy!")
+    self.odswiez_ksiazki()
+
+  def usun_ksiazke(self):
+    wybrany = self.tabela_ksiazek.selection()
+    if not wybrany:
+      messagebox.showwarning("Uwaga", "Zaznacz książkę do usunięcia z listy!")
+      return
+
+    dane = self.tabela_ksiazek.item(wybrany)
+    book_id = dane["values"][0]
+    tytul_ksiazki = dane["values"][1]
+
+    if messagebox.askyesno(
+        "Potwierdzenie",
+        f"Czy na pewno chcesz usunąć książkę '{tytul_ksiazki}'?\n(Zostaną też"
+        " usunięte powiązane wpisy o wypożyczeniach)",
+    ):
+      conn = sqlite3.connect("biblioteka.db")
+      cursor = conn.cursor()
+      cursor.execute("DELETE FROM Loans WHERE book_id = ?", (book_id,))
+      cursor.execute("DELETE FROM Books WHERE id = ?", (book_id,))
+      conn.commit()
+      conn.close()
+
+      messagebox.showinfo("Sukces", "Książka została usunięta z bazy.")
+      self.odswiez_ksiazki()
+      self.odswiez_wypozyczenia()
+      self.odswiez_czytelnikow()
+
+  def dodaj_czytelnika(self):
+    nazwa = self.entry_nazwa_czytelnika.get().strip()
+    kod_czytelnika = self.entry_kod_czytelnika_form.get().strip()
+
+    if not nazwa:
+      messagebox.showerror("Błąd", "Wpisz imię i nazwisko użytkownika!")
+      return
+
+    val_kod = kod_czytelnika if kod_czytelnika else None
+
+    try:
+      conn = sqlite3.connect("biblioteka.db")
+      cursor = conn.cursor()
+      cursor.execute(
+          "INSERT INTO Users (name, barcode) VALUES (?, ?)", (nazwa, val_kod)
+      )
+      conn.commit()
+      conn.close()
+
+      self.entry_nazwa_czytelnika.delete(0, tk.END)
+      self.entry_kod_czytelnika_form.delete(0, tk.END)
+      self.entry_szukaj_czytelnika.delete(0, tk.END)
+
+      messagebox.showinfo("Sukces", "Zarejestrowano nowego użytkownika!")
+      self.odswiez_czytelnikow()
+    except sqlite3.IntegrityError:
+      messagebox.showerror(
+          "Błąd", "Ten kod kreskowy / login jest już zajęty przez kogoś innego!"
+      )
+    except Exception as e:
+      messagebox.showerror("Błąd", f"Wystąpił problem: {e}")
+
+  def wypelnij_pola_czytelnika(self, event):
+    wybrany = self.tabela_czytelnikow.selection()
+    if not wybrany:
+      return
+    dane = self.tabela_czytelnikow.item(wybrany)
+    _, nazwa, kod, _ = dane["values"]
+
+    self.entry_nazwa_czytelnika.delete(0, tk.END)
+    self.entry_nazwa_czytelnika.insert(0, nazwa)
+
+    self.entry_kod_czytelnika_form.delete(0, tk.END)
+    if kod != "-":
+      self.entry_kod_czytelnika_form.insert(0, kod)
+
+  def zapisz_edycje_czytelnika(self):
+    wybrany = self.tabela_czytelnikow.selection()
+    if not wybrany:
+      messagebox.showwarning(
+          "Uwaga", "Zaznacz użytkownika z listy, którego chcesz edytować!"
+      )
+      return
+
+    dane = self.tabela_czytelnikow.item(wybrany)
+    user_id = dane["values"][0]
+
+    nowa_nazwa = self.entry_nazwa_czytelnika.get().strip()
+    nowy_kod = self.entry_kod_czytelnika_form.get().strip()
+
+    if not nowa_nazwa:
+      messagebox.showerror("Błąd", "Imię i nazwisko nie może być puste!")
+      return
+
+    conn = sqlite3.connect("biblioteka.db")
+    cursor = conn.cursor()
+    try:
+      cursor.execute(
+          "UPDATE Users SET name = ?, barcode = ? WHERE id = ?",
+          (nowa_nazwa, nowy_kod if nowy_kod else None, user_id),
+      )
+      conn.commit()
+      messagebox.showinfo("Sukces", "Zaktualizowano dane użytkownika!")
+      self.entry_nazwa_czytelnika.delete(0, tk.END)
+      self.entry_kod_czytelnika_form.delete(0, tk.END)
+    except sqlite3.IntegrityError:
+      messagebox.showerror(
+          "Błąd", "Podany kod kreskowy / login jest już przypisany innej osobie!"
+      )
+    conn.close()
+    self.odswiez_czytelnikow()
+
+  def usun_czytelnika(self):
+    wybrany = self.tabela_czytelnikow.selection()
+    if not wybrany:
+      messagebox.showwarning("Uwaga", "Zaznacz użytkownika do usunięcia!")
+      return
+
+    dane = self.tabela_czytelnikow.item(wybrany)
+    user_id = dane["values"][0]
+    user_name = dane["values"][1]
+
+    if messagebox.askyesno(
+        "Potwierdzenie", f"Czy na pewno chcesz usunąć użytkownika {user_name}?"
+    ):
+      conn = sqlite3.connect("biblioteka.db")
+      cursor = conn.cursor()
+      cursor.execute("DELETE FROM Users WHERE id = ?", (user_id,))
+      conn.commit()
+      conn.close()
+
+      messagebox.showinfo("Sukces", "Użytkownik został usunięty.")
+      self.entry_nazwa_czytelnika.delete(0, tk.END)
+      self.entry_kod_czytelnika_form.delete(0, tk.END)
+      self.odswiez_czytelnikow()
+
+  def pokaz_karte_czytelnika(self):
+    wybrany = self.tabela_czytelnikow.selection()
+    if not wybrany:
+      messagebox.showwarning("Uwaga", "Zaznacz użytkownika z listy!")
+      return
+
+    dane = self.tabela_czytelnikow.item(wybrany)
+    user_id = dane["values"][0]
+    user_name = dane["values"][1]
+
+    conn = sqlite3.connect("biblioteka.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+            SELECT Books.title, Loans.borrow_date, Loans.due_date 
+            FROM Loans 
+            JOIN Books ON Loans.book_id = Books.id 
+            WHERE Loans.user_id = ?
+        """,
+        (user_id,),
+    )
+    wypozyczenia = cursor.fetchall()
+    conn.close()
+
+    okno_karta = tk.Toplevel(self.root)
+    okno_karta.title(f"Karta użytkownika: {user_name}")
+    okno_karta.geometry("450x350")
+
+    tk.Label(
+        okno_karta,
+        text=f"Karta Użytkownika\n{user_name}",
+        font=("Arial", 12, "bold"),
+        fg="#9C27B0",
+    ).pack(pady=10)
+
+    tk.Label(
+        okno_karta,
+        text=f"Aktywne wypożyczenia ({len(wypozyczenia)}):",
+        font=("Arial", 10, "bold"),
+    ).pack(anchor="w", padx=15)
+
+    frame_ksiazki = tk.Frame(okno_karta)
+    frame_ksiazki.pack(fill="both", expand=True, padx=15, pady=5)
+
+    tabela_karty = ttk.Treeview(
+        frame_ksiazki, columns=("Tytuł", "Od", "Do"), show="headings"
+    )
+    tabela_karty.heading("Tytuł", text="Książka")
+    tabela_karty.heading("Od", text="Wypożyczono")
+    tabela_karty.heading("Do", text="Termin zwrotu")
+
+    tabela_karty.column("Tytuł", width=220)
+    tabela_karty.column("Od", width=95, anchor="center")
+    tabela_karty.column("Do", width=95, anchor="center")
+    tabela_karty.pack(fill="both", expand=True)
+
+    for w in wypozyczenia:
+      tabela_karty.insert("", "end", values=(w[0], w[1], w[2]))
+
+  def otworz_okno_wypozyczenia(self):
+    wybrany = self.tabela_ksiazek.selection()
+    if not wybrany:
+      messagebox.showwarning("Uwaga", "Zaznacz najpierw książkę do wypożyczenia!")
+      return
+
+    dane = self.tabela_ksiazek.item(wybrany)
+    self.wybrana_ksiazka_id = dane["values"][0]
+    tytul_ksiazki = dane["values"][1]
+    dostepne = int(dane["values"][5])
+
+    if dostepne <= 0:
+      messagebox.showerror("Błąd", "Brak dostępnych egzemplarzy tej książki!")
+      return
+
+    conn = sqlite3.connect("biblioteka.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name FROM Users")
+    czytelnicy = cursor.fetchall()
+    conn.close()
+
+    if not czytelnicy:
+      messagebox.showerror("Błąd", "Brak zarejestrowanych użytkowników w bazie!")
+      return
+
+    okno_wyp = tk.Toplevel(self.root)
+    okno_wyp.title("Wypożycz książkę")
+    okno_wyp.geometry("350x380")
+
+    tk.Label(
+        okno_wyp,
+        text=f"Książka:\n{tytul_ksiazki}",
+        font=("Arial", 10, "bold"),
+        justify="center",
+    ).pack(pady=10)
+
+    tk.Label(okno_wyp, text="Wybierz użytkownika:").pack(anchor="w", padx=20)
+
+    self.wybrany_czytelnik = tk.StringVar()
+    opcje = [f"{u[0]} - {u[1]}" for u in czytelnicy]
+
+    combo = ttk.Combobox(
+        okno_wyp,
+        textvariable=self.wybrany_czytelnik,
+        values=opcje,
+        width=35,
+        state="readonly",
+    )
+    combo.pack(padx=20, pady=5)
+    if opcje:
+      combo.current(0)
+
+    tk.Label(okno_wyp, text="Czas wypożyczenia:").pack(
+        anchor="w", padx=20, pady=(10, 0)
+    )
+
+    self.tryb_terminu = tk.StringVar(value="auto")
+    domyslne_dni = pobierz_ustawienie("loan_days")
+
+    rb_auto = tk.Radiobutton(
+        okno_wyp,
+        text=f"Automatyczny (z ustawień: {domyslne_dni} dni)",
+        variable=self.tryb_terminu,
+        value="auto",
+    )
+    rb_auto.pack(anchor="w", padx=20)
+
+    rb_wlasny = tk.Radiobutton(
+        okno_wyp, text="Własna liczba dni:", variable=self.tryb_terminu, value="custom"
+    )
+    rb_wlasny.pack(anchor="w", padx=20)
+
+    self.entry_własne_dni = tk.Entry(okno_wyp, width=12)
+    self.entry_własne_dni.pack(anchor="w", padx=40, pady=2)
+    self.entry_własne_dni.insert(0, "14")
+
+    btn_potwierdz = tk.Button(
+        okno_wyp,
+        text="Potwierdź wypożyczenie",
+        bg="#2196F3",
+        fg="white",
+        font=("Arial", 10, "bold"),
+        command=lambda: self.zapisz_wypozyczenie(okno_wyp),
+    )
+    btn_potwierdz.pack(pady=15)
+
+  def zapisz_wypozyczenie(self, okno_wyp):
+    wybor_tekst = self.wybrany_czytelnik.get()
+    user_id = int(wybor_tekst.split(" - ")[0])
+
+    if self.tryb_terminu.get() == "auto":
+      dni_wyp = int(pobierz_ustawienie("loan_days"))
+    else:
+      własne_str = self.entry_własne_dni.get().strip()
+      if not własne_str.isdigit():
+        messagebox.showerror(
+            "Błąd", "Własna liczba dni musi być pełną liczbą całkowitą!"
+        )
+        return
+      dni_wyp = int(własne_str)
+
+    dzisiaj = datetime.date.today()
+    termin = dzisiaj + datetime.timedelta(days=dni_wyp)
+
+    data_dzisiejsza = dzisiaj.strftime("%Y-%m-%d")
+    data_terminu = termin.strftime("%Y-%m-%d")
+
+    conn = sqlite3.connect("biblioteka.db")
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+            INSERT INTO Loans (book_id, user_id, borrow_date, due_date) 
+            VALUES (?, ?, ?, ?)
+        """,
+        (self.wybrana_ksiazka_id, user_id, data_dzisiejsza, data_terminu),
+    )
+    cursor.execute(
+        "UPDATE Books SET available_copies = available_copies - 1 WHERE id = ?",
+        (self.wybrana_ksiazka_id,),
+    )
+
+    conn.commit()
+    conn.close()
+
+    okno_wyp.destroy()
+    messagebox.showinfo(
+        "Sukces",
+        f"Książka wypożyczona pomyślnie!\nTermin zwrotu: {data_terminu}",
+    )
+
+    self.odswiez_ksiazki()
+    self.odswiez_czytelnikow()
+    self.odswiez_wypozyczenia()
+
+  def zroc_ksiazke(self):
+    wybrany = self.tabela_wypozyczen.selection()
+    if not wybrany:
+      messagebox.showwarning("Uwaga", "Zaznacz wypożyczenie do zwrotu z listy!")
+      return
+
+    dane = self.tabela_wypozyczen.item(wybrany)
+    loan_id = dane["values"][0]
+
+    conn = sqlite3.connect("biblioteka.db")
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT book_id FROM Loans WHERE id = ?", (loan_id,))
+    wynik = cursor.fetchone()
+
+    if wynik:
+      book_id = wynik[0]
+
+      cursor.execute("DELETE FROM Loans WHERE id = ?", (loan_id,))
+      cursor.execute(
+          "UPDATE Books SET available_copies = available_copies + 1 WHERE id ="
+          " ?",
+          (book_id,),
+      )
+
+      conn.commit()
+      conn.close()
+
+      messagebox.showinfo("Sukces", "Książka została pomyślnie zwrócona!")
+
+      self.odswiez_ksiazki()
+      self.odswiez_czytelnikow()
+      self.odswiez_wypozyczenia()
+    else:
+      conn.close()
+      messagebox.showerror("Błąd", "Nie znaleziono takiego wypożyczenia.")
+
+
+def start_glownej_aplikacji(nazwa_uzytkownika, id_uzytkownika):
+  root = tk.Tk()
+  AplikacjaBiblioteka(root, nazwa_uzytkownika, id_uzytkownika)
+  root.mainloop()
+
+
+if __name__ == "__main__":
+  root_logowania = tk.Tk()
+  OknoLogowania(root_logowania)
+  root_logowania.mainloop()
