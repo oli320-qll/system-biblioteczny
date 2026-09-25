@@ -4,7 +4,14 @@ import pandas as pd
 from datetime import date, timedelta
 import io
 
+# Wyłączenie przerwy technicznej
+PRZERWA_TECHNICZNA = False
+
 st.set_page_config(page_title="System Biblioteczny", layout="wide")
+
+if PRZERWA_TECHNICZNA:
+    st.warning("⚠️ Przerwa techniczna! System Librus jest obecnie niedostępny z powodu prac konserwacyjnych. Zapraszamy w godzinach od 12:00 do 14:00.")
+    st.stop()
 
 # Połączenie z bazą danych
 conn = sqlite3.connect("biblioteka_kompletna.db", check_same_thread=False)
@@ -256,7 +263,6 @@ if tryb == "Panel Stacjonarny (Biblioteka)":
             tyt = c.fetchone()[0]
             st.write(f"Książka: **{tyt}**")
             
-            # Pobieramy rezerwację, która jest Aktywna lub Zaakceptowana
             c.execute("SELECT czytelnik FROM rezerwacje WHERE ksiazka_id = ? AND status IN ('Aktywna', 'Zaakceptowana')", (kid,))
             rez_info = c.fetchone()
             
@@ -457,7 +463,7 @@ if tryb == "Panel Stacjonarny (Biblioteka)":
         '''
         
         if szukaj_wyp:
-            df_wyp = pd.read_sql(f'''
+            df_wyp = pd.read_sql('''
                 SELECT w.id, w.czytelnik, k.tytul as [Książka], k.kod_kreskowy as [Kod Kreskowy], w.data_wypozyczenia as [Data wypożyczenia], w.data_zwrotu as [Termin zwrotu]
                 FROM wypozyczenia w JOIN ksiazki k ON w.ksiazka_id = k.id 
                 WHERE w.status = 'Wypożyczona' AND (k.tytul LIKE ? OR k.kod_kreskowy LIKE ? OR w.czytelnik LIKE ?)
@@ -619,86 +625,67 @@ else:
         st.markdown(f"Liczba pozycji na półce: **{len(st.session_state['koszyk'])}**")
         
         if st.session_state["koszyk"]:
-            placeholders = ','.join(['?'] * len(st.session_state["koszyk"]))
-            df_koszyk = pd.read_sql(f"SELECT * FROM ksiazki WHERE id IN ({placeholders})", conn, params=tuple(st.session_state["koszyk"]))
-            st.dataframe(df_koszyk[['id', 'tytul', 'autor', 'stan']], use_container_width=True, hide_index=True)
+            placeho = pd.read_sql(f"SELECT * FROM ksiazki WHERE id IN ({','.join(map(str, st.session_state['koszyk']))})", conn)
+            st.dataframe(placeho, use_container_width=True, hide_index=True)
             
-            if st.button("Zarezerwuj wybrane pozycje"):
-                if st.session_state["czytelnik_zalogowany"]:
-                    for kid in st.session_state["koszyk"]:
-                        c.execute("SELECT stan FROM ksiazki WHERE id = ?", (kid,))
-                        aktualny_stan = c.fetchone()[0]
-                        if aktualny_stan == 'Dostępna':
-                            c.execute("INSERT INTO rezerwacje (ksiazka_id, czytelnik, data_rezerwacji, status) VALUES (?, ?, ?, ?)",
-                                      (kid, st.session_state["czytelnik_zalogowany"], str(date.today()), 'Aktywna'))
-                            c.execute("UPDATE ksiazki SET stan = 'Zarezerwowana' WHERE id = ?", (kid,))
-                    conn.commit()
-                    st.session_state["koszyk"] = []
-                    st.success("Rezerwacja została wysłana do bibliotekarza!")
-                    st.rerun()
-                else:
-                    st.error("❌ Musisz być zalogowany kodem, aby dokonać rezerwacji!")
-            
-            if st.button("Wyczyść półkę"):
+            if st.button("🗑️ Wyczyść półkę"):
                 st.session_state["koszyk"] = []
                 st.rerun()
+                
+            st.markdown("### Zatwierdź rezerwację")
+            if not st.session_state["czytelnik_zalogowany"]:
+                st.warning("⚠️ Musisz być zalogowany w zakładce 'Moje Konto / Rejestracja', aby złożyć rezerwację.")
+            else:
+                if st.button("🚀 Wyślij rezerwację do biblioteki", type="primary"):
+                    dzis = str(date.today())
+                    for kid in st.session_state["koszyk"]:
+                        c.execute("INSERT INTO rezerwacje (ksiazka_id, czytelnik, data_rezerwacji, status) VALUES (?, ?, ?, ?)",
+                                  (kid, st.session_state["czytelnik_zalogowany"], dzis, 'Aktywna'))
+                        c.execute("UPDATE ksiazki SET stan = 'Zarezerwowana' WHERE id = ?", (kid,))
+                    conn.commit()
+                    st.session_state["koszyk"] = []
+                    st.success("Pomyślnie złożono rezerwacje! Sprawdź status w bibliotece.")
+                    st.rerun()
         else:
-            st.info("Twoja półka jest pusta.")
+            st.info("Twoja półka jest pusta. Dodaj książki z zakładki Katalog.")
 
     elif menu_opac == "Moje Konto / Rejestracja":
-        st.subheader("Strefa Czytelnika")
-        tab_log, tab_reg = st.tabs(["🔑 Zaloguj się kodem", "📝 Zarejestruj nowe konto"])
+        st.subheader("Panel Czytelnika")
         
-        with tab_log:
-            if not st.session_state["czytelnik_zalogowany"]:
-                with st.form("form_log_czyt"):
-                    kod_wejscie = st.text_input("Wpisz swój unikalny identyfikator / kod karty:")
-                    if st.form_submit_button("Zaloguj się"):
-                        c.execute("SELECT imie_nazwisko FROM czytelnici WHERE kod_karty = ?", (kod_wejscie,))
-                        res = c.fetchone()
-                        if res:
-                            st.session_state["czytelnik_zalogowany"] = res[0]
-                            st.success(f"Witaj, {res[0]}!")
-                            st.rerun()
-                        else:
-                            st.error("Nie znaleziono czytelnika o takim kodzie.")
-            else:
-                st.write(f"Zalogowany użytkownik: **{st.session_state['czytelnik_zalogowany']}**")
-                
-                c.execute("SELECT k.tytul FROM rezerwacje r JOIN ksiazki k ON r.ksiazka_id = k.id WHERE r.czytelnik = ? AND r.status = 'Zaakceptowana'", (st.session_state["czytelnik_zalogowany"],))
-                zaakceptowane_rezerwacje = c.fetchall()
-                
-                if zaakceptowane_rezerwacje:
-                    st.success("🎉 **Twoja rezerwacja została zaakceptowana! Udaj się do biblioteki i odbierz swoje książki.**")
-                    tytuly_zaak = ", ".join([row[0] for row in zaakceptowane_rezerwacje])
-                    st.info(f"Dotyczy książek: **{tytuly_zaak}**")
-
-                st.markdown("#### Twoje aktywne wypożyczenia:")
-                df_w_cz = pd.read_sql("SELECT k.tytul, w.data_wypozyczenia, w.data_zwrotu FROM wypozyczenia w JOIN ksiazki k ON w.ksiazka_id = k.id WHERE w.czytelnik = ? AND w.status = 'Wypożyczona'", conn, params=(st.session_state["czytelnik_zalogowany"],))
-                st.dataframe(df_w_cz, use_container_width=True, hide_index=True)
-
-                st.markdown("#### Twoje aktywne rezerwacje:")
-                df_r_cz = pd.read_sql("SELECT k.tytul, r.data_rezerwacji, r.status FROM rezerwacje r JOIN ksiazki k ON r.ksiazka_id = k.id WHERE r.czytelnik = ? AND r.status IN ('Aktywna', 'Zaakceptowana', 'Oczekuje na zwrot')", conn, params=(st.session_state["czytelnik_zalogowany"],))
-                st.dataframe(df_r_cz, use_container_width=True, hide_index=True)
-                
-                if st.button("Wyloguj z konta"):
+        c_k1, c_k2 = st.columns(2)
+        with c_k1:
+            st.markdown("#### Logowanie")
+            with st.form("form_log_czyt"):
+                kod_karty_log = st.text_input("Kod karty:")
+                pin_log = st.text_input("PIN (domyślnie 1234):", type="password")
+                if st.form_submit_button("Zaloguj się"):
+                    c.execute("SELECT imie_nazwisko FROM czytelnici WHERE kod_karty = ? AND pin = ?", (kod_karty_log, pin_log))
+                    res_c = c.fetchone()
+                    if res_c:
+                        st.session_state["czytelnik_zalogowany"] = res_c[0]
+                        st.success(f"Witaj, {res_c[0]}!")
+                        st.rerun()
+                    else:
+                        st.error("Błędny kod karty lub PIN.")
+                        
+            if st.session_state["czytelnik_zalogowany"]:
+                if st.button("Wyloguj mnie"):
                     st.session_state["czytelnik_zalogowany"] = None
                     st.rerun()
-                    
-        with tab_reg:
-            with st.form("form_reg_mobilna"):
-                nowe_imie = st.text_input("Twoje Imię i Nazwisko:")
-                nowy_kod = st.text_input("Wymyśl swój unikalny kod / PIN (np. 1234 lub własny identyfikator):")
-                if st.form_submit_button("Zarejestruj się"):
-                    if nowe_imie and nowy_kod:
-                        try:
-                            c.execute("INSERT INTO czytelnici (imie_nazwisko, kod_karty) VALUES (?, ?)", (nowe_imie, nowy_kod))
-                            conn.commit()
-                            st.success("Konto utworzone pomyślnie! Przejdź do zakładki logowania i wpisz swój kod.")
-                        except sqlite3.IntegrityError:
-                            st.error("❌ Ten kod/identyfikator jest już zajęty. Wybierz inny.")
-                    else:
-                        st.warning("Uzupełnij imię i kod.")
 
-    st.markdown("---")
-    st.caption("OPAC e-Biblioteka domowa — wersja 3.7")
+        with c_k2:
+            st.markdown("#### Rejestracja nowego czytelnika")
+            with st.form("form_rej_czyt"):
+                nowy_imie = st.text_input("Imię i nazwisko:")
+                nowy_kod = st.text_input("Wymyśl kod karty / identyfikator:")
+                nowy_pin = st.text_input("Wymyśl PIN (np. 1234):", type="password", value="1234")
+                if st.form_submit_button("Zarejestruj się"):
+                    if nowy_imie and nowy_kod:
+                        try:
+                            c.execute("INSERT INTO czytelnici (imie_nazwisko, kod_karty, pin) VALUES (?, ?, ?)", (nowy_imie, nowy_kod, nowy_pin))
+                            conn.commit()
+                            st.success("Zarejestrowano pomyślnie! Teraz możesz się zalogować.")
+                        except sqlite3.IntegrityError:
+                            st.error("Taki kod karty już istnieje w bazie.")
+                    else:
+                        st.error("Uzupełnij wymagane pola.")
