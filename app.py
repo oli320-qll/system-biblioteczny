@@ -1,704 +1,1006 @@
+import datetime
 import sqlite3
-import streamlit as st
-import pandas as pd
-from datetime import date, timedelta
-import io
+import tkinter as tk
+from tkinter import messagebox, ttk
 
-st.set_page_config(page_title="System Biblioteczny", layout="wide")
 
-# Połączenie z bazą danych
-conn = sqlite3.connect("biblioteka_kompletna.db", check_same_thread=False)
-c = conn.cursor()
+# --- BAZA DANYCH ---
+def zainicjalizuj_baze():
+    conn = sqlite3.connect("biblioteka_nowa.db")
+    cursor = conn.cursor()
 
-# Tworzenie i aktualizacja tabel
-c.execute('''
-    CREATE TABLE IF NOT EXISTS ksiazki (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tytul TEXT,
-        autor TEXT,
-        rodzaj TEXT,
-        kod_kreskowy TEXT,
-        stan TEXT
+    # Tabela książek
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Books (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            author TEXT NOT NULL,
+            genre TEXT,
+            barcode TEXT,
+            available_copies INTEGER NOT NULL
+        )
+    """)
+
+    # Tabela czytelników (użytkowników)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            barcode TEXT UNIQUE
+        )
+    """)
+
+    # Bezpieczna migracja dla starszych baz danych (dodanie kolumny barcode, jeśli jej brakuje)
+    cursor.execute("PRAGMA table_info(Users)")
+    kolumny_users = [k[1] for k in cursor.fetchall()]
+    if "barcode" not in kolumny_users:
+        try:
+            cursor.execute("ALTER TABLE Users ADD COLUMN barcode TEXT UNIQUE")
+        except sqlite3.OperationalError:
+            pass
+
+    # Tabela wypożyczeń
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Loans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            book_id INTEGER,
+            user_id INTEGER,
+            borrow_date TEXT,
+            due_date TEXT,
+            FOREIGN KEY (book_id) REFERENCES Books(id),
+            FOREIGN KEY (user_id) REFERENCES Users(id)
+        )
+    """)
+
+    # Tabela ustawień
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    cursor.execute(
+        "INSERT OR IGNORE INTO Settings (key, value) VALUES ('loan_days', '14')"
     )
-''')
 
-c.execute('''
-    CREATE TABLE IF NOT EXISTS czytelnici (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        imie_nazwisko TEXT,
-        kod_karty TEXT UNIQUE,
-        pin TEXT DEFAULT '1234'
+    conn.commit()
+    conn.close()
+
+
+def pobierz_ustawienie(klucz):
+    conn = sqlite3.connect("biblioteka.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM Settings WHERE key = ?", (klucz,))
+    wynik = cursor.fetchone()
+    conn.close()
+    return wynik[0] if wynik else "14"
+
+
+def zapisz_ustawienie(klucz, wartosc):
+    conn = sqlite3.connect("biblioteka.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR REPLACE INTO Settings (key, value) VALUES (?, ?)",
+        (klucz, wartosc),
     )
-''')
+    conn.commit()
+    conn.close()
 
-c.execute('''
-    CREATE TABLE IF NOT EXISTS pracownicy (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        imie_nazwisko TEXT,
-        kod_identyfikator TEXT UNIQUE
-    )
-''')
 
-c.execute("INSERT OR IGNORE INTO pracownicy (id, imie_nazwisko, kod_identyfikator) VALUES (1, 'Administrator', 'ADMIN123')")
-conn.commit()
+# --- OKNO LOGOWANIA (PEŁNY EKRAN) ---
+class OknoLogowania:
 
-c.execute('''
-    CREATE TABLE IF NOT EXISTS wypozyczenia (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ksiazka_id INTEGER,
-        czytelnik TEXT,
-        data_wypozyczenia TEXT,
-        data_zwrotu TEXT,
-        status TEXT,
-        FOREIGN KEY(ksiazka_id) REFERENCES ksiazki(id)
-    )
-''')
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Logowanie - System Biblioteczny")
+        self.root.attributes("-fullscreen", True)
 
-c.execute('''
-    CREATE TABLE IF NOT EXISTS rezerwacje (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ksiazka_id INTEGER,
-        czytelnik TEXT,
-        data_rezerwacji TEXT,
-        status TEXT,
-        FOREIGN KEY(ksiazka_id) REFERENCES ksiazki(id)
-    )
-''')
+        zainicjalizuj_baze()
 
-c.execute('''
-    CREATE TABLE IF NOT EXISTS ustawienia (
-        klucz TEXT PRIMARY KEY,
-        wartosc TEXT
-    )
-''')
-c.execute("INSERT OR IGNORE INTO ustawienia (klucz, wartosc) VALUES ('czas_wypozyczenia', '14')")
-conn.commit()
+        rama_glowna = tk.Frame(root)
+        rama_glowna.place(relx=0.5, rely=0.5, anchor="center")
 
-headers = st.context.headers if hasattr(st, "context") and hasattr(st.context, "headers") else {}
-host_header = headers.get("Host", "")
+        tk.Label(
+            rama_glowna,
+            text="📚 System Biblioteczny Pro+",
+            font=("Arial", 22, "bold"),
+            fg="#2196F3",
+        ).pack(pady=20)
+        tk.Label(
+            rama_glowna,
+            text="Zeskanuj kod kreskowy lub wpisz swój identyfikator:",
+            font=("Arial", 12),
+        ).pack(pady=5)
 
-if "ngrok" in host_header:
-    domyslny_tryb = "Katalog Online OPAC (Czytelnik)"
-else:
-    domyslny_tryb = "Panel Stacjonarny (Biblioteka)"
+        self.entry_kod = tk.Entry(
+            rama_glowna, width=30, font=("Arial", 16), justify="center"
+        )
+        self.entry_kod.pack(pady=15)
+        self.entry_kod.focus()
+        self.entry_kod.bind("<Return>", lambda e: self.zaloguj())
 
-st.sidebar.title("📚 System Biblioteki")
-tryb = st.sidebar.radio("Wybierz widok:", ["Panel Stacjonarny (Biblioteka)", "Katalog Online OPAC (Czytelnik)"], index=0 if domyslny_tryb == "Panel Stacjonarny (Biblioteka)" else 1)
-st.sidebar.divider()
+        btn_login = tk.Button(
+            rama_glowna,
+            text="Zaloguj się",
+            bg="#4CAF50",
+            fg="white",
+            font=("Arial", 12, "bold"),
+            width=20,
+            command=self.zaloguj,
+        )
+        btn_login.pack(pady=10)
 
-if tryb == "Panel Stacjonarny (Biblioteka)":
-    if "zalogowany_admin" not in st.session_state:
-        st.session_state["zalogowany_admin"] = False
-    if "pracownik_imie" not in st.session_state:
-        st.session_state["pracownik_imie"] = ""
+        btn_wyjscie = tk.Button(
+            rama_glowna,
+            text="Zamknij program",
+            bg="#F44336",
+            fg="white",
+            font=("Arial", 10),
+            width=15,
+            command=root.destroy,
+        )
+        btn_wyjscie.pack(pady=20)
 
-    if not st.session_state["zalogowany_admin"]:
-        st.title("🔐 System Biblioteka")
-        st.markdown("### Logowanie do systemu")
-        
-        with st.form("form_log_pracownik_kod"):
-            st.write("Wpisz kod PIN lub zeskanuj identyfikator:")
-            kod_wejscie = st.text_input("Identyfikator:", type="password", label_visibility="collapsed")
-            btn = st.form_submit_button("Zaloguj się")
-            if btn:
-                c.execute("SELECT imie_nazwisko FROM pracownicy WHERE kod_identyfikator = ?", (kod_wejscie,))
-                res = c.fetchone()
-                if res or kod_wejscie == "ADMIN123":
-                    st.session_state["zalogowany_admin"] = True
-                    st.session_state["pracownik_imie"] = res[0] if res else "Administrator"
-                    st.success("Zalogowano pomyślnie!")
-                    st.rerun()
-                else:
-                    st.error("❌ Błędny identyfikator pracownika!")
-        st.stop()
+        root.bind("<Escape>", lambda e: root.attributes("-fullscreen", False))
 
-    col_top1, col_top2 = st.columns([8, 2])
-    with col_top1:
-        st.markdown(f"### Panel Biblioteki — Zalogowany pracownik: **{st.session_state['pracownik_imie']}**")
-    with col_top2:
-        if st.button("Wyloguj", type="primary"):
-            st.session_state["zalogowany_admin"] = False
-            st.session_state["pracownik_imie"] = ""
-            st.rerun()
+    def zaloguj(self):
+        kod = self.entry_kod.get().strip()
 
-    st.divider()
-    tab1, tab_import, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "Książki i Katalog", 
-        "📥 Import z CSV/Sheets",
-        "Czytelnici", 
-        "Zarządzanie Pracownikami", 
-        "Wypożyczenia i Zwroty", 
-        "Rezerwacje", 
-        "Ustawienia",
-        "Raporty i Statystyki"
-    ])
+        if not kod:
+            messagebox.showerror("Błąd", "Wpisz lub zeskanuj kod kreskowy!")
+            return
 
-    with tab1:
-        col_szukaj, col_btn = st.columns([9, 1])
-        with col_szukaj:
-            szukaj_ksiazki = st.text_input("🔍 Szukaj książki (tytuł, autor, rodzaj, kod):", key="szuk_ks_st")
-        with col_btn:
-            st.write("")
-            if st.button("Wyczyść"):
-                st.rerun()
+        # Zaktualizowany kod administratora na "1234"
+        if kod == "1234":
+            self.root.destroy()
+            start_glownej_aplikacji("Administrator", "admin")
+            return
 
-        c1, c2 = st.columns([1, 3])
-        with c1:
-            st.markdown("#### Dodaj książkę")
-            tytul = st.text_input("Tytuł:", key="add_tytul")
-            autor = st.text_input("Autor:", key="add_autor")
-            rodzaj = st.text_input("Rodzaj / Kategoria:", key="add_rodzaj")
-            kod_kreskowy = st.text_input("Kod kreskowy (ISBN):", key="add_kod")
-            liczba_sztuk = st.number_input("Liczba sztuk:", min_value=1, value=1, key="add_sztuki")
-            
-            if st.button("Zapisz książkę w bazie", type="primary"):
-                if tytul and autor:
-                    for _ in range(liczba_sztuk):
-                        c.execute("INSERT INTO ksiazki (tytul, autor, rodzaj, kod_kreskowy, stan) VALUES (?, ?, ?, ?, ?)",
-                                  (tytul, autor, rodzaj, kod_kreskowy, "Dostępna"))
-                    conn.commit()
-                    st.success("Dodano książkę pomyślnie!")
-                    st.rerun()
-                else:
-                    st.error("Wpisz tytuł i autora.")
+        conn = sqlite3.connect("biblioteka.db")
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, name FROM Users WHERE barcode = ? OR id = ?", (kod, kod)
+        )
+        uzytkownik = cursor.fetchone()
+        conn.close()
 
-        with c2:
-            if szukaj_ksiazki:
-                q = "SELECT * FROM ksiazki WHERE tytul LIKE ? OR autor LIKE ? OR rodzaj LIKE ? OR kod_kreskowy LIKE ?"
-                df_ksiazki = pd.read_sql(q, conn, params=(f"%{szukaj_ksiazki}%", f"%{szukaj_ksiazki}%", f"%{szukaj_ksiazki}%", f"%{szukaj_ksiazki}%"))
-            else:
-                df_ksiazki = pd.read_sql("SELECT * FROM ksiazki", conn)
-                
-            event = st.dataframe(
-                df_ksiazki, 
-                use_container_width=True, 
-                hide_index=True,
-                selection_mode="single-row",
-                on_select="rerun",
-                key="tabela_ksiazek"
+        if uzytkownik:
+            user_id, user_name = uzytkownik
+            self.root.destroy()
+            start_glownej_aplikacji(user_name, user_id)
+        else:
+            messagebox.showerror(
+                "Błąd logowania",
+                "Nie znaleziono użytkownika o takim kodzie kreskowym lub ID!",
             )
-            
-            wybrany_id = None
-            selected_rows = event.selection.rows if event and hasattr(event, "selection") else []
-            if selected_rows:
-                row_idx = selected_rows[0]
-                wybrany_id = int(df_ksiazki.iloc[row_idx]['id'])
+            self.entry_kod.delete(0, tk.END)
 
-            if not df_ksiazki.empty:
-                st.markdown("#### Zarządzanie wybraną książką")
-                opcje_select = (df_ksiazki['id'].astype(str) + " - " + df_ksiazki['tytul'] + " (" + df_ksiazki['stan'] + ")").tolist()
-                domyslny_index = 0
-                if wybrany_id is not None:
-                    for idx, opcja in enumerate(opcje_select):
-                        if opcja.startswith(str(wybrany_id) + " - "):
-                            domyslny_index = idx
-                            break
 
-                wybrana_do_wyp = st.selectbox("Kliknij wiersz w tabeli powyżej lub wybierz z listy:", opcje_select, index=domyslny_index)
-                
-                kid = int(wybrana_do_wyp.split(" - ")[0])
-                
-                kol_ak1, kol_ak2, kol_ak3 = st.columns(3)
-                with kol_ak1:
-                    c.execute("SELECT stan FROM ksiazki WHERE id = ?", (kid,))
-                    aktualny_stan_ks = c.fetchone()[0]
-                    if aktualny_stan_ks == 'Wypożyczona':
-                        st.warning("Ta książka jest już wypożyczona.")
-                    else:
-                        if st.button("Wypożycz tę pozycję"):
-                            st.session_state['wypozycz_id'] = kid
-                            st.rerun()
-                with kol_ak2:
-                    if st.button("Edytuj dane książki"):
-                        st.session_state['edytuj_ksiazka_id'] = kid
-                        st.rerun()
-                with kol_ak3:
-                    if st.button("Usuń książkę", type="secondary"):
-                        c.execute("DELETE FROM ksiazki WHERE id = ?", (kid,))
-                        conn.commit()
-                        st.success("Usunięto książkę!")
-                        st.rerun()
+# --- GŁÓWNA APLIKACJA (PEŁNY EKRAN) ---
+class AplikacjaBiblioteka:
 
-        if 'edytuj_ksiazka_id' in st.session_state:
-            st.markdown("---")
-            st.subheader("✏️ Edycja danych książki")
-            eid = st.session_state['edytuj_ksiazka_id']
-            c.execute("SELECT tytul, autor, rodzaj, kod_kreskowy, stan FROM ksiazki WHERE id = ?", (eid,))
-            akt_dane = c.fetchone()
-            
-            if akt_dane:
-                with st.form("form_edit_book"):
-                    e_tytul = st.text_input("Tytuł:", value=akt_dane[0])
-                    e_autor = st.text_input("Autor:", value=akt_dane[1])
-                    e_rodzaj = st.text_input("Rodzaj / Kategoria:", value=akt_dane[2])
-                    e_kod = st.text_input("Kod kreskowy (ISBN):", value=akt_dane[3] if akt_dane[3] else "")
-                    e_stan = st.selectbox("Stan:", ["Dostępna", "Wypożyczona", "Zarezerwowana"], index=["Dostępna", "Wypożyczona", "Zarezerwowana"].index(akt_dane[4]) if akt_dane[4] in ["Dostępna", "Wypożyczona", "Zarezerwowana"] else 0)
-                    
-                    col_e1, col_e2 = st.columns(2)
-                    with col_e1:
-                        if st.form_submit_button("Zapisz zmiany"):
-                            c.execute("UPDATE ksiazki SET tytul = ?, autor = ?, rodzaj = ?, kod_kreskowy = ?, stan = ? WHERE id = ?",
-                                      (e_tytul, e_autor, e_rodzaj, e_kod, e_stan, eid))
-                            conn.commit()
-                            st.success("Zaktualizowano dane książki!")
-                            del st.session_state['edytuj_ksiazka_id']
-                            st.rerun()
-                    with col_e2:
-                        if st.form_submit_button("Anuluj edycję"):
-                            del st.session_state['edytuj_ksiazka_id']
-                            st.rerun()
+    def __init__(self, root, nazwa_uzytkownika, id_uzytkownika):
+        self.root = root
+        self.nazwa_uzytkownika = nazwa_uzytkownika
+        self.id_uzytkownika = id_uzytkownika
 
-        if 'wypozycz_id' in st.session_state:
-            st.markdown("---")
-            st.subheader("Wypożyczenie pozycji")
-            kid = st.session_state['wypozycz_id']
-            c.execute("SELECT tytul FROM ksiazki WHERE id = ?", (kid,))
-            tyt = c.fetchone()[0]
-            st.write(f"Książka: **{tyt}**")
-            
-            # Pobieramy rezerwację, która jest Aktywna lub Zaakceptowana
-            c.execute("SELECT czytelnik FROM rezerwacje WHERE ksiazka_id = ? AND status IN ('Aktywna', 'Zaakceptowana')", (kid,))
-            rez_info = c.fetchone()
-            
-            if rez_info:
-                zarezerwowal_kto = rez_info[0]
-                st.error(f"🔒 **BLOKADA REZERWACJI:** Ta książka jest zarezerwowana przez: **{zarezerwowal_kto}**. System automatycznie przypisze ją do tej osoby i nie pozwoli wypożyczyć jej nikomu innemu.")
-                wybrany_wpis_czyt = zarezerwowal_kto
-                st.write(f"Wybrany czytelnik: **{zarezerwowal_kto}**")
+        self.root.title(
+            f"System Biblioteczny Pro+ (Zalogowany: {nazwa_uzytkownika})"
+        )
+        self.root.attributes("-fullscreen", True)
+
+        pasek_uzytkownika = tk.Frame(root, bg="#ECEFF1", pady=5)
+        pasek_uzytkownika.pack(fill="x")
+        tk.Label(
+            pasek_uzytkownika,
+            text=(
+                f"👤 Zalogowany: {nazwa_uzytkownika} "
+                f"({'Administrator' if str(id_uzytkownika) == 'admin' else 'Czytelnik'})"
+            ),
+            bg="#ECEFF1",
+            font=("Arial", 10, "bold"),
+        ).pack(side="left", padx=10)
+
+        btn_wyloguj = tk.Button(
+            pasek_uzytkownika,
+            text="Wyloguj",
+            bg="#F44336",
+            fg="white",
+            font=("Arial", 9, "bold"),
+            command=self.wyloguj,
+        )
+        btn_wyloguj.pack(side="right", padx=10)
+
+        notebook = ttk.Notebook(root)
+        notebook.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.zakladka_ksiazki = ttk.Frame(notebook)
+        self.zakladka_czytelnicy = ttk.Frame(notebook)
+        self.zakladka_wypozyczenia = ttk.Frame(notebook)
+        self.zakladka_ustawienia = ttk.Frame(notebook)
+
+        notebook.add(self.zakladka_ksiazki, text=" 📚 Książki ")
+        notebook.add(self.zakladka_czytelnicy, text=" 👤 Użytkownicy ")
+        notebook.add(self.zakladka_wypozyczenia, text=" 🔄 Wypożyczenia ")
+        notebook.add(self.zakladka_ustawienia, text=" ⚙️ Ustawienia ")
+
+        self.zbuduj_widok_ksiazek()
+        self.zbuduj_widok_czytelnikow()
+        self.zbuduj_widok_wypozyczen()
+        self.zbuduj_widok_ustawien()
+
+        root.bind("<Escape>", lambda e: root.attributes("-fullscreen", False))
+
+    def wyloguj(self):
+        self.root.destroy()
+        root_logowania = tk.Tk()
+        OknoLogowania(root_logowania)
+        root_logowania.mainloop()
+
+    # ==================== 1. ZAKŁADKA: KSIĄŻKI ====================
+    def zbuduj_widok_ksiazek(self):
+        if str(self.id_uzytkownika) == "admin":
+            rama_dodawania = tk.LabelFrame(
+                self.zakladka_ksiazki,
+                text=" Dodaj nową książkę ",
+                font=("Arial", 10, "bold"),
+            )
+            rama_dodawania.pack(fill="x", padx=10, pady=5)
+
+            tk.Label(rama_dodawania, text="Tytuł:").pack(anchor="w", padx=5)
+            self.entry_tytul = tk.Entry(rama_dodawania, width=50)
+            self.entry_tytul.pack(padx=5, pady=2)
+
+            tk.Label(rama_dodawania, text="Autor:").pack(anchor="w", padx=5)
+            self.entry_autor = tk.Entry(rama_dodawania, width=50)
+            self.entry_autor.pack(padx=5, pady=2)
+
+            tk.Label(rama_dodawania, text="Gatunek:").pack(anchor="w", padx=5)
+            self.entry_gatunek = tk.Entry(rama_dodawania, width=50)
+            self.entry_gatunek.pack(padx=5, pady=2)
+
+            tk.Label(rama_dodawania, text="Kod kreskowy:").pack(anchor="w", padx=5)
+            self.entry_kod_ksiazki = tk.Entry(rama_dodawania, width=50)
+            self.entry_kod_ksiazki.pack(padx=5, pady=2)
+
+            tk.Label(rama_dodawania, text="Liczba egzemplarzy:").pack(anchor="w", padx=5)
+            self.entry_sztuki = tk.Entry(rama_dodawania, width=50)
+            self.entry_sztuki.pack(padx=5, pady=2)
+
+            btn_dodaj = tk.Button(
+                rama_dodawania,
+                text="Dodaj książkę",
+                bg="#4CAF50",
+                fg="white",
+                font=("Arial", 10, "bold"),
+                command=self.dodaj_ksiazke,
+            )
+            btn_dodaj.pack(pady=8)
+
+        rama_szukaj = tk.LabelFrame(
+            self.zakladka_ksiazki,
+            text=" 🔍 Wyszukiwarka książek ",
+            font=("Arial", 10, "bold"),
+        )
+        rama_szukaj.pack(fill="x", padx=10, pady=5)
+
+        self.entry_szukaj_ksiazki = tk.Entry(rama_szukaj, width=50)
+        self.entry_szukaj_ksiazki.pack(side="left", padx=5, pady=5)
+        self.entry_szukaj_ksiazki.bind(
+            "<KeyRelease>", lambda e: self.odswiez_ksiazki()
+        )
+
+        btn_czysc_szukanie = tk.Button(
+            rama_szukaj, text="Wyczyść", command=self.wyczysc_szukanie_ksiazek
+        )
+        btn_czysc_szukanie.pack(side="left", padx=5)
+
+        rama_lista = tk.LabelFrame(
+            self.zakladka_ksiazki, text=" Katalog książek ", font=("Arial", 10, "bold")
+        )
+        rama_lista.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.tabela_ksiazek = ttk.Treeview(
+            rama_lista,
+            columns=("ID", "Tytuł", "Autor", "Gatunek", "Kod", "Sztuki"),
+            show="headings",
+        )
+        self.tabela_ksiazek.heading("ID", text="ID")
+        self.tabela_ksiazek.heading("Tytuł", text="Tytuł")
+        self.tabela_ksiazek.heading("Autor", text="Autor")
+        self.tabela_ksiazek.heading("Gatunek", text="Gatunek")
+        self.tabela_ksiazek.heading("Kod", text="Kod")
+        self.tabela_ksiazek.heading("Sztuki", text="Stan")
+
+        self.tabela_ksiazek.column("ID", width=40, anchor="center")
+        self.tabela_ksiazek.column("Tytuł", width=300)
+        self.tabela_ksiazek.column("Autor", width=250)
+        self.tabela_ksiazek.column("Gatunek", width=150)
+        self.tabela_ksiazek.column("Kod", width=120, anchor="center")
+        self.tabela_ksiazek.column("Sztuki", width=70, anchor="center")
+        self.tabela_ksiazek.pack(fill="both", expand=True, padx=5, pady=5)
+
+        if str(self.id_uzytkownika) == "admin":
+            rama_przyciski_ksiazki = tk.Frame(self.zakladka_ksiazki)
+            rama_przyciski_ksiazki.pack(pady=10)
+
+            btn_wypozycz = tk.Button(
+                rama_przyciski_ksiazki,
+                text="Wypożycz zaznaczoną książkę",
+                bg="#2196F3",
+                fg="white",
+                font=("Arial", 10, "bold"),
+                command=self.otworz_okno_wypozyczenia,
+            )
+            btn_wypozycz.pack(side="left", padx=5)
+
+            btn_usun_ksiazke = tk.Button(
+                rama_przyciski_ksiazki,
+                text="Usuń zaznaczoną książkę",
+                bg="#F44336",
+                fg="white",
+                font=("Arial", 10, "bold"),
+                command=self.usun_ksiazke,
+            )
+            btn_usun_ksiazke.pack(side="left", padx=5)
+
+        self.odswiez_ksiazki()
+
+    # ==================== 2. ZAKŁADKA: UŻYTKOWNICY ====================
+    def zbuduj_widok_czytelnikow(self):
+        if str(self.id_uzytkownika) == "admin":
+            rama_dodawania_uzyt = tk.LabelFrame(
+                self.zakladka_czytelnicy,
+                text=" Zarządzanie użytkownikami (Dodaj / Edytuj) ",
+                font=("Arial", 10, "bold"),
+            )
+            rama_dodawania_uzyt.pack(fill="x", padx=10, pady=5)
+
+            tk.Label(rama_dodawania_uzyt, text="Imię i nazwisko:").pack(
+                anchor="w", padx=5
+            )
+            self.entry_nazwa_czytelnika = tk.Entry(rama_dodawania_uzyt, width=50)
+            self.entry_nazwa_czytelnika.pack(padx=5, pady=2)
+
+            tk.Label(rama_dodawania_uzyt, text="Kod kreskowy / Login:").pack(
+                anchor="w", padx=5
+            )
+            self.entry_kod_czytelnika_form = tk.Entry(rama_dodawania_uzyt, width=50)
+            self.entry_kod_czytelnika_form.pack(padx=5, pady=2)
+
+            rame_btn_uzyt = tk.Frame(rama_dodawania_uzyt)
+            rame_btn_uzyt.pack(pady=8)
+
+            btn_dodaj_uzyt = tk.Button(
+                rame_btn_uzyt,
+                text="Dodaj nowego",
+                bg="#4CAF50",
+                fg="white",
+                font=("Arial", 10, "bold"),
+                command=self.dodaj_czytelnika,
+            )
+            btn_dodaj_uzyt.pack(side="left", padx=5)
+
+            btn_zapisz_edycje = tk.Button(
+                rame_btn_uzyt,
+                text="Zapisz zmiany",
+                bg="#FF9800",
+                fg="white",
+                font=("Arial", 10, "bold"),
+                command=self.zapisz_edycje_czytelnika,
+            )
+            btn_zapisz_edycje.pack(side="left", padx=5)
+
+            btn_usun_uzyt = tk.Button(
+                rame_btn_uzyt,
+                text="Usuń użytkownika",
+                bg="#F44336",
+                fg="white",
+                font=("Arial", 10, "bold"),
+                command=self.usun_czytelnika,
+            )
+            btn_usun_uzyt.pack(side="left", padx=5)
+
+        rama_szukaj_uzyt = tk.LabelFrame(
+            self.zakladka_czytelnicy,
+            text=" 🔍 Wyszukiwarka użytkowników ",
+            font=("Arial", 10, "bold"),
+        )
+        rama_szukaj_uzyt.pack(fill="x", padx=10, pady=5)
+
+        self.entry_szukaj_czytelnika = tk.Entry(rama_szukaj_uzyt, width=50)
+        self.entry_szukaj_czytelnika.pack(side="left", padx=5, pady=5)
+        self.entry_szukaj_czytelnika.bind(
+            "<KeyRelease>", lambda e: self.odswiez_czytelnikow()
+        )
+
+        btn_czysc_szukanie_uzyt = tk.Button(
+            rama_szukaj_uzyt, text="Wyczyść", command=self.wyczysc_szukanie_czytelnikow
+        )
+        btn_czysc_szukanie_uzyt.pack(side="left", padx=5)
+
+        rama_lista_uzyt = tk.LabelFrame(
+            self.zakladka_czytelnicy,
+            text=(
+                " Lista użytkowników "
+                if str(self.id_uzytkownika) == "admin"
+                else " Twoje konto "
+            ),
+            font=("Arial", 10, "bold"),
+        )
+        rama_lista_uzyt.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.tabela_czytelnikow = ttk.Treeview(
+            rama_lista_uzyt,
+            columns=("ID", "Nazwa", "Kod", "Wypożyczone"),
+            show="headings",
+        )
+        self.tabela_czytelnikow.heading("ID", text="ID")
+        self.tabela_czytelnikow.heading("Nazwa", text="Imię i nazwisko")
+        self.tabela_czytelnikow.heading("Kod", text="Kod kreskowy / Login")
+        self.tabela_czytelnikow.heading("Wypożyczone", text="Aktywne wypożyczenia")
+
+        self.tabela_czytelnikow.column("ID", width=50, anchor="center")
+        self.tabela_czytelnikow.column("Nazwa", width=300)
+        self.tabela_czytelnikow.column("Kod", width=200, anchor="center")
+        self.tabela_czytelnikow.column("Wypożyczone", width=150, anchor="center")
+        self.tabela_czytelnikow.pack(fill="both", expand=True, padx=5, pady=5)
+
+        if str(self.id_uzytkownika) == "admin":
+            self.tabela_czytelnikow.bind(
+                "<ButtonRelease-1>", self.wypelnij_pola_czytelnika
+            )
+
+        btn_karta = tk.Button(
+            self.zakladka_czytelnicy,
+            text="Wyświetl szczegółową kartę / wypożyczenia",
+            bg="#9C27B0",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            command=self.pokaz_karte_czytelnika,
+        )
+        btn_karta.pack(pady=10)
+
+        self.odswiez_czytelnikow()
+
+    # ==================== 3. ZAKŁADKA: WYPOŻYCZENIA ====================
+    def zbuduj_widok_wypozyczen(self):
+        rama_wyp = tk.LabelFrame(
+            self.zakladka_wypozyczenia,
+            text=(
+                " Aktywne wypożyczenia w systemie "
+                if str(self.id_uzytkownika) == "admin"
+                else " Twoje wypożyczone książki "
+            ),
+            font=("Arial", 10, "bold"),
+        )
+        rama_wyp.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.tabela_wypozyczen = ttk.Treeview(
+            rama_wyp,
+            columns=("LoanID", "Czytelnik", "Książka", "DataW", "Termin"),
+            show="headings",
+        )
+        self.tabela_wypozyczen.heading("LoanID", text="ID")
+        self.tabela_wypozyczen.heading("Czytelnik", text="Czytelnik")
+        self.tabela_wypozyczen.heading("Książka", text="Książka")
+        self.tabela_wypozyczen.heading("DataW", text="Wypożyczono")
+        self.tabela_wypozyczen.heading("Termin", text="Termin zwrotu")
+
+        self.tabela_wypozyczen.column("LoanID", width=50, anchor="center")
+        self.tabela_wypozyczen.column("Czytelnik", width=250)
+        self.tabela_wypozyczen.column("Książka", width=350)
+        self.tabela_wypozyczen.column("DataW", width=150, anchor="center")
+        self.tabela_wypozyczen.column("Termin", width=150, anchor="center")
+        self.tabela_wypozyczen.pack(fill="both", expand=True, padx=5, pady=5)
+
+        if str(self.id_uzytkownika) == "admin":
+            btn_zwrot = tk.Button(
+                self.zakladka_wypozyczenia,
+                text="Zwróć zaznaczoną książkę",
+                bg="#FF9800",
+                fg="white",
+                font=("Arial", 10, "bold"),
+                command=self.zroc_ksiazke,
+            )
+            btn_zwrot.pack(pady=10)
+
+        self.odswiez_wypozyczenia()
+
+    # ==================== 4. ZAKŁADKA: USTAWIENIA ====================
+    def zbuduj_widok_ustawien(self):
+        rama_ust = tk.LabelFrame(
+            self.zakladka_ustawienia,
+            text=" Ustawienia systemu ",
+            font=("Arial", 10, "bold"),
+        )
+        rama_ust.pack(fill="both", expand=True, padx=10, pady=10)
+
+        tk.Label(
+            rama_ust,
+            text="Domyślny czas wypożyczenia (w dniach):",
+            font=("Arial", 10),
+        ).pack(anchor="w", padx=15, pady=5)
+        self.entry_dni = tk.Entry(rama_ust, width=20)
+        self.entry_dni.pack(anchor="w", padx=15, pady=2)
+        self.entry_dni.insert(0, pobierz_ustawienie("loan_days"))
+
+        if str(self.id_uzytkownika) == "admin":
+            btn_zapisz_ust = tk.Button(
+                rama_ust,
+                text="Zapisz ustawienia",
+                bg="#607D8B",
+                fg="white",
+                font=("Arial", 10, "bold"),
+                command=self.zapisz_konfiguracje,
+            )
+            btn_zapisz_ust.pack(anchor="w", padx=15, pady=10)
+
+            # --- SPECJALNA SEKCJA DLA ADMINA: STATYSTYKA SYSTEMU ---
+            rama_stat = tk.LabelFrame(
+                rama_ust, text=" 📊 Statystyki systemu ", font=("Arial", 10, "bold")
+            )
+            rama_stat.pack(fill="x", padx=15, pady=15)
+
+            self.label_stat_ksiazki = tk.Label(
+                rama_stat, text="Liczba unikalnych książek: ...", font=("Arial", 10)
+            )
+            self.label_stat_ksiazki.pack(anchor="w", padx=10, pady=2)
+
+            self.label_stat_czytelnicy = tk.Label(
+                rama_stat, text="Liczba użytkowników: ...", font=("Arial", 10)
+            )
+            self.label_stat_czytelnicy.pack(anchor="w", padx=10, pady=2)
+
+            self.label_stat_wypozyczenia = tk.Label(
+                rama_stat, text="Aktywne wypożyczenia: ...", font=("Arial", 10)
+            )
+            self.label_stat_wypozyczenia.pack(anchor="w", padx=10, pady=2)
+
+            btn_odswiez_stat = tk.Button(
+                rama_stat,
+                text="Odśwież statystyki",
+                bg="#009688",
+                fg="white",
+                font=("Arial", 9, "bold"),
+                command=self.aktualizuj_statystyki,
+            )
+            btn_odswiez_stat.pack(anchor="w", padx=10, pady=8)
+
+            self.aktualizuj_statystyki()
+
+        else:
+            self.entry_dni.config(state="disabled")
+
+        info_label = tk.Label(
+            rama_ust,
+            text=(
+                f"ℹ️ Zalogowany użytkownik: {self.nazwa_uzytkownika}\n- Aby wyjść z"
+                " pełnego ekranu, naciśnij klawisz Escape."
+            ),
+            justify="left",
+            fg="gray",
+            font=("Arial", 10),
+        )
+        info_label.pack(anchor="w", padx=15, pady=15)
+
+    def aktualizuj_statystyki(self):
+        conn = sqlite3.connect("biblioteka.db")
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT COUNT(*) FROM Books")
+        liczba_ksiazek = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM Users")
+        liczba_czytelnikow = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM Loans")
+        liczba_wypozyczen = cursor.fetchone()[0]
+
+        conn.close()
+
+        self.label_stat_ksiazki.config(
+            text=f"Liczba unikalnych książek: {liczba_ksiazek}"
+        )
+        self.label_stat_czytelnicy.config(
+            text=f"Liczba użytkowników: {liczba_czytelnikow}"
+        )
+        self.label_stat_wypozyczenia.config(
+            text=f"Aktywne wypożyczenia: {liczba_wypozyczen}"
+        )
+
+    def zapisz_konfiguracje(self):
+        dni = self.entry_dni.get().strip()
+        if not dni.isdigit():
+            messagebox.showerror("Błąd", "Liczba dni musi być wartością całkowitą!")
+            return
+        zapisz_ustawienie("loan_days", dni)
+        messagebox.showinfo("Sukces", "Zapisano ustawienia systemowe!")
+
+    # ==================== FUNKCJE BIZNESOWE ====================
+    def odswiez_ksiazki(self):
+        for row in self.tabela_ksiazek.get_children():
+            self.tabela_ksiazek.delete(row)
+
+        szukaj = self.entry_szukaj_ksiazki.get().strip()
+        conn = sqlite3.connect("biblioteka.db")
+        cursor = conn.cursor()
+
+        if szukaj:
+            cursor.execute(
+                """
+                SELECT * FROM Books 
+                WHERE title LIKE ? OR author LIKE ? OR genre LIKE ? OR barcode LIKE ?
+            """,
+                (f"%{szukaj}%", f"%{szukaj}%", f"%{szukaj}%", f"%{szukaj}%"),
+            )
+        else:
+            cursor.execute("SELECT * FROM Books")
+
+        for k in cursor.fetchall():
+            self.tabela_ksiazek.insert(
+                "", "end", values=(k[0], k[1], k[2], k[3], k[4], k[5])
+            )
+        conn.close()
+
+    def wyczysc_szukanie_ksiazek(self):
+        self.entry_szukaj_ksiazki.delete(0, tk.END)
+        self.odswiez_ksiazki()
+
+    def odswiez_czytelnikow(self):
+        for row in self.tabela_czytelnikow.get_children():
+            self.tabela_czytelnikow.delete(row)
+
+        szukaj = self.entry_szukaj_czytelnika.get().strip()
+        conn = sqlite3.connect("biblioteka.db")
+        cursor = conn.cursor()
+
+        if str(self.id_uzytkownika) != "admin":
+            cursor.execute(
+                """
+                SELECT Users.id, Users.name, Users.barcode, COUNT(Loans.id) 
+                FROM Users 
+                LEFT JOIN Loans ON Users.id = Loans.user_id 
+                WHERE Users.id = ?
+                GROUP BY Users.id
+            """,
+                (self.id_uzytkownika,),
+            )
+        else:
+            if szukaj:
+                cursor.execute(
+                    """
+                    SELECT Users.id, Users.name, Users.barcode, COUNT(Loans.id) 
+                    FROM Users 
+                    LEFT JOIN Loans ON Users.id = Loans.user_id 
+                    WHERE Users.name LIKE ? OR Users.barcode LIKE ?
+                    GROUP BY Users.id
+                """,
+                    (f"%{szukaj}%", f"%{szukaj}%"),
+                )
             else:
-                df_czyt_wyp = pd.read_sql("SELECT imie_nazwisko, kod_karty FROM czytelnici", conn)
-                lista_osob = (df_czyt_wyp['imie_nazwisko'] + " (Kod: " + df_czyt_wyp['kod_karty'] + ")").tolist() if not df_czyt_wyp.empty else []
-                wybrany_wpis_czyt_box = st.selectbox("Wybierz czytelnika:", lista_osob) if lista_osob else ""
-                wybrany_wpis_czyt = wybrany_wpis_czyt_box.split(" (Kod:")[0] if wybrany_wpis_czyt_box else ""
-            
-            tryb_terminu = st.radio("Termin zwrotu", ["Automatyczny (z ustawień)", "Własna liczba dni"])
-            c.execute("SELECT wartosc FROM ustawienia WHERE klucz = 'czas_wypozyczenia'")
-            def_dni = int(c.fetchone()[0])
-            final_dni = st.number_input("Liczba dni:", min_value=1, value=def_dni) if tryb_terminu == "Własna liczba dni" else def_dni
-                
-            col_ok, col_an = st.columns(2)
-            with col_ok:
-                if st.button("Zatwierdź wypożyczenie"):
-                    if wybrany_wpis_czyt:
-                        dzis = date.today()
-                        termin = dzis + timedelta(days=final_dni)
-                        c.execute("UPDATE ksiazki SET stan = 'Wypożyczona' WHERE id = ?", (kid,))
-                        c.execute("INSERT INTO wypozyczenia (ksiazka_id, czytelnik, data_wypozyczenia, data_zwrotu, status) VALUES (?, ?, ?, ?, ?)",
-                                  (kid, wybrany_wpis_czyt, str(dzis), str(termin), 'Wypożyczona'))
-                        c.execute("UPDATE rezerwacje SET status = 'Oczekuje na zwrot' WHERE ksiazka_id = ? AND status IN ('Aktywna', 'Zaakceptowana')", (kid,))
-                        conn.commit()
-                        st.success(f"Wypożyczono pomyślnie dla czytelnika: {wybrany_wpis_czyt}!")
-                        del st.session_state['wypozycz_id']
-                        st.rerun()
-                    else:
-                        st.error("Brak wybranego czytelnika!")
-            with col_an:
-                if st.button("Anuluj"):
-                    del st.session_state['wypozycz_id']
-                    st.rerun()
+                cursor.execute("""
+                    SELECT Users.id, Users.name, Users.barcode, COUNT(Loans.id) 
+                    FROM Users 
+                    LEFT JOIN Loans ON Users.id = Loans.user_id 
+                    GROUP BY Users.id
+                """)
 
-    with tab_import:
-        st.subheader("📥 Masowy import książek z pliku CSV (np. z Google Sheets)")
-        st.markdown("""
-        **Instrukcja:**
-        1. W Google Sheets stwórz tabelę z następującymi nagłówkami w pierwszej kolumnie: **tytul**, **autor**, **rodzaj**, **kod_kreskowy**.
-        2. Wpisz lub wklej swoje książki.
-        3. W Google Sheets kliknij **Plik -> Pobierz -> Wartości rozdzielane przecinkami (.csv)**.
-        4. Wgraj pobrany plik poniżej i kliknij przycisk importu!
+        for u in cursor.fetchall():
+            self.tabela_czytelnikow.insert(
+                "", "end", values=(u[0], u[1], u[2] if u[2] else "-", u[3])
+            )
+        conn.close()
+
+    def wyczysc_szukanie_czytelnikow(self):
+        self.entry_szukaj_czytelnika.delete(0, tk.END)
+        self.odswiez_czytelnikow()
+
+    def odswiez_wypozyczenia(self):
+        for row in self.tabela_wypozyczen.get_children():
+            self.tabela_wypozyczen.delete(row)
+        conn = sqlite3.connect("biblioteka.db")
+        cursor = conn.cursor()
+
+        if str(self.id_uzytkownika) != "admin":
+            cursor.execute(
+                """
+                SELECT Loans.id, Users.name, Books.title, Loans.borrow_date, Loans.due_date 
+                FROM Loans 
+                JOIN Users ON Loans.user_id = Users.id 
+                JOIN Books ON Loans.book_id = Books.id
+                WHERE Loans.user_id = ?
+            """,
+                (self.id_uzytkownika,),
+            )
+        else:
+            cursor.execute("""
+            SELECT Loans.id, Users.name, Books.title, Loans.borrow_date, Loans.due_date 
+            FROM Loans 
+            JOIN Users ON Loans.user_id = Users.id 
+            JOIN Books ON Loans.book_id = Books.id
         """)
-        
-        uploaded_file = st.file_uploader("Wybierz plik CSV z książkami", type=["csv"])
-        if uploaded_file is not None:
-            try:
-                df_import = pd.read_csv(uploaded_file)
-                st.write("Podgląd wgranych danych:")
-                st.dataframe(df_import, use_container_width=True)
-                
-                wymagane = ['tytul', 'autor']
-                if all(col in df_import.columns for col in wymagane):
-                    if st.button("🚀 Importuj te książki do bazy", type="primary"):
-                        licznik = 0
-                        for _, row in df_import.iterrows():
-                            tytul = str(row['tytul'])
-                            autor = str(row['autor'])
-                            rodzaj = str(row['rodzaj']) if 'rodzaj' in df_import.columns and pd.notna(row['rodzaj']) else ""
-                            kod = str(row['kod_kreskowy']) if 'kod_kreskowy' in df_import.columns and pd.notna(row['kod_kreskowy']) else ""
-                            
-                            c.execute("INSERT INTO ksiazki (tytul, autor, rodzaj, kod_kreskowy, stan) VALUES (?, ?, ?, ?, ?)",
-                                      (tytul, autor, rodzaj, kod, "Dostępna"))
-                            licznik += 1
-                        conn.commit()
-                        st.success(f"Pomyślnie zaimportowano {licznik} książek do biblioteki!")
-                        st.rerun()
-                else:
-                    st.error("❌ Plik CSV musi zawierać przynajmniej kolumny o nazwach: `tytul` oraz `autor`!")
-            except Exception as e:
-                st.error(f"Błąd podczas odczytu pliku: {e}")
 
-    with tab2:
-        st.subheader("Baza czytelników")
-        col_cz1, col_cz2 = st.columns([1, 2])
-        with col_cz1:
-            with st.form("form_add_reader"):
-                imie_nazwisko = st.text_input("Imię i nazwisko:")
-                kod_karty = st.text_input("Kod karty / Identyfikator:")
-                if st.form_submit_button("Zapisz czytelnika"):
-                    if imie_nazwisko and kod_karty:
-                        try:
-                            c.execute("INSERT INTO czytelnici (imie_nazwisko, kod_karty) VALUES (?, ?)", (imie_nazwisko, kod_karty))
-                            conn.commit()
-                            st.success("Dodano czytelnika!")
-                            st.rerun()
-                        except sqlite3.IntegrityError:
-                            st.error("❌ Taki kod karty już istnieje!")
-                    else:
-                        st.error("Uzupełnij pola.")
-        with col_cz2:
-            df_czytelnici = pd.read_sql("SELECT id, imie_nazwisko as [Imię i Nazwisko], kod_karty as [Kod karty] FROM czytelnici", conn)
-            st.dataframe(df_czytelnici, use_container_width=True, hide_index=True)
-            
-            if not df_czytelnici.empty:
-                wybrany_czyt_del = st.selectbox("Wybierz czytelnika do usunięcia:", df_czytelnici['id'].astype(str) + " - " + df_czytelnici['Imię i Nazwisko'])
-                if st.button("Usuń zaznaczonego czytelnika", type="secondary"):
-                    cid = int(wybrany_czyt_del.split(" - ")[0])
-                    c.execute("DELETE FROM czytelnici WHERE id = ?", (cid,))
-                    conn.commit()
-                    st.success("Usunięto czytelnika!")
-                    st.rerun()
+        for w in cursor.fetchall():
+            self.tabela_wypozyczen.insert("", "end", values=(w[0], w[1], w[2], w[3], w[4]))
+        conn.close()
 
-    with tab3:
-        st.subheader("👥 Zarządzanie Pracownikami Biblioteki")
-        col_p1, col_p2 = st.columns([1, 2])
-        with col_p1:
-            with st.form("form_add_pracownik"):
-                 imie_prac = st.text_input("Imię i nazwisko pracownika:")
-                 kod_prac = st.text_input("Unikalny kod / identyfikator:")
-                 if st.form_submit_button("Zapisz pracownika"):
-                     if imie_prac and kod_prac:
-                         try:
-                             c.execute("INSERT INTO pracownicy (imie_nazwisko, kod_identyfikator) VALUES (?, ?)", (imie_prac, kod_prac))
-                             conn.commit()
-                             st.success(f"Dodano pracownika: {imie_prac}")
-                             st.rerun()
-                         except sqlite3.IntegrityError:
-                             st.error("❌ Taki identyfikator jest już zajęty!")
-                     else:
-                         st.error("Uzupełnij wszystkie pola.")
-                         
-        with col_p2:
-            df_pracownicy = pd.read_sql("SELECT id, imie_nazwisko as [Imię i Nazwisko], kod_identyfikator as [Kod identyfikacyjny] FROM pracownicy", conn)
-            st.dataframe(df_pracownicy, use_container_width=True, hide_index=True)
-            
-            if not df_pracownicy.empty:
-                wybrany_prac_del = st.selectbox("Wybierz pracownika do usunięcia:", df_pracownicy['id'].astype(str) + " - " + df_pracownicy['Imię i Nazwisko'])
-                if st.button("Usuń zaznaczonego pracownika", type="secondary"):
-                    pid = int(wybrany_prac_del.split(" - ")[0])
-                    if pid == 1:
-                        st.error("Nie można usunąć głównego konta administratora!")
-                    else:
-                        c.execute("DELETE FROM pracownicy WHERE id = ?", (pid,))
-                        conn.commit()
-                        st.success("Usunięto pracownika!")
-                        st.rerun()
+    def dodaj_ksiazke(self):
+        tytul = self.entry_tytul.get()
+        autor = self.entry_autor.get()
+        gatunek = self.entry_gatunek.get()
+        kod = self.entry_kod_ksiazki.get()
+        sztuki_str = self.entry_sztuki.get()
 
-    with tab4:
-        st.subheader("📋 Aktywne wypożyczenia i zwroty")
-        
-        with st.expander("📷 Szybki zwrot po kodzie kreskowym książki"):
-            skan_kod = st.text_input("Wpisz lub zeskanuj kod kreskowy książki:")
-            if skan_kod:
-                c.execute('''
-                    SELECT w.id, w.czytelnik, k.tytul, k.kod_kreskowy, k.id 
-                    FROM wypozyczenia w JOIN ksiazki k ON w.ksiazka_id = k.id 
-                    WHERE k.kod_kreskowy = ? AND w.status = 'Wypożyczona'
-                ''', (skan_kod,))
-                wynik_skanu = c.fetchone()
-                if wynik_skanu:
-                    w_id, w_czyt, w_tytul, w_kod, kid = wynik_skanu
-                    st.success(f"Znaleziono książkę: **{w_tytul}** | Czytelnik: **{w_czyt}**")
-                    if st.button("Potwierdź zwrot tej książki", type="primary", key="btn_szybki_zwrot"):
-                        c.execute("UPDATE ksiazki SET stan = 'Dostępna' WHERE id = ?", (kid,))
-                        c.execute("UPDATE wypozyczenia SET status = 'Zwrócona' WHERE id = ?", (w_id,))
-                        c.execute("UPDATE rezerwacje SET status = 'Zrealizowana' WHERE ksiazka_id = ? AND status = 'Oczekuje na zwrot'", (kid,))
-                        conn.commit()
-                        st.success("Przyjęto zwrot książki pomyślnie! Rezerwacja została ostatecznie zamknięta.")
-                        st.rerun()
-                else:
-                    st.warning("❌ Brak aktywnego wypożyczenia dla podanego kodu kreskowego.")
+        if not tytul or not autor or not sztuki_str:
+            messagebox.showerror("Błąd", "Wypełnij przynajmniej tytuł, autora i stan!")
+            return
 
-        with st.expander("🔎 Sprawdź stan konta czytelnika (ile ma książek)"):
-            szukaj_konta = st.text_input("Wpisz kod karty lub imię/nazwisko czytelnika:")
-            if szukaj_konta:
-                c.execute("SELECT imie_nazwisko, kod_karty FROM czytelnici WHERE kod_karty LIKE ? OR imie_nazwisko LIKE ?", (f"%{szukaj_konta}%", f"%{szukaj_konta}%"))
-                wyniki_czyt = c.fetchall()
-                if wyniki_czyt:
-                    for imie_szukanego, kod_szukanego in wyniki_czyt:
-                        st.markdown(f"**Czytelnik:** {imie_szukanego} (Kod karty: `{kod_szukanego}`)")
-                        df_wyp_szukanego = pd.read_sql('''
-                            SELECT k.tytul as [Książka], k.kod_kreskowy as [Kod Kreskowy], w.data_wypozyczenia as [Data wypożyczenia], w.data_zwrotu as [Termin zwrotu]
-                            FROM wypozyczenia w JOIN ksiazki k ON w.ksiazka_id = k.id 
-                            WHERE w.czytelnik = ? AND w.status = 'Wypożyczona'
-                        ''', conn, params=(imie_szukanego,))
-                        
-                        ile_ksiazek = len(df_wyp_szukanego)
-                        st.info(f"Aktualnie wypożyczonych książek na koncie: **{ile_ksiazek}**")
-                        if ile_ksiazek > 0:
-                            st.dataframe(df_wyp_szukanego, use_container_width=True, hide_index=True)
-                        st.divider()
-                else:
-                    st.warning("Nie znaleziono takiego czytelnika w bazie.")
-        
-        st.markdown("---")
-        szukaj_wyp = st.text_input("🔍 Szukaj wypożyczenia (tytuł książki, kod kreskowy lub imię czytelnika):", key="sz_wyp_lupka")
-        
-        query_wyp = '''
-            SELECT w.id, w.czytelnik, k.tytul as [Książka], k.kod_kreskowy as [Kod Kreskowy], w.data_wypozyczenia as [Data wypożyczenia], w.data_zwrotu as [Termin zwrotu]
-            FROM wypozyczenia w JOIN ksiazki k ON w.ksiazka_id = k.id WHERE w.status = 'Wypożyczona'
-        '''
-        
-        if szukaj_wyp:
-            df_wyp = pd.read_sql(f'''
-                SELECT w.id, w.czytelnik, k.tytul as [Książka], k.kod_kreskowy as [Kod Kreskowy], w.data_wypozyczenia as [Data wypożyczenia], w.data_zwrotu as [Termin zwrotu]
-                FROM wypozyczenia w JOIN ksiazki k ON w.ksiazka_id = k.id 
-                WHERE w.status = 'Wypożyczona' AND (k.tytul LIKE ? OR k.kod_kreskowy LIKE ? OR w.czytelnik LIKE ?)
-            ''', conn, params=(f"%{szukaj_wyp}%", f"%{szukaj_wyp}%", f"%{szukaj_wyp}%"))
-        else:
-            df_wyp = pd.read_sql(query_wyp, conn)
-            
-        st.dataframe(df_wyp, use_container_width=True, hide_index=True)
-        
-        if not df_wyp.empty:
-            wybrany_zw = st.selectbox("Wybierz wypożyczenie do zwrotu:", df_wyp['id'].astype(str) + " - " + df_wyp['czytelnik'] + " (" + df_wyp['Książka'] + ")")
-            if st.button("Przyjmij zwrot", type="primary"):
-                wid = int(wybrany_zw.split(" - ")[0])
-                c.execute("SELECT ksiazka_id FROM wypozyczenia WHERE id = ?", (wid,))
-                kid = c.fetchone()[0]
-                c.execute("UPDATE ksiazki SET stan = 'Dostępna' WHERE id = ?", (kid,))
-                c.execute("UPDATE wypozyczenia SET status = 'Zwrócona' WHERE id = ?", (wid,))
-                c.execute("UPDATE rezerwacje SET status = 'Zrealizowana' WHERE ksiazka_id = ? AND status = 'Oczekuje na zwrot'", (kid,))
-                conn.commit()
-                st.success("Przyjęto zwrot książki! Rezerwacja została ostatecznie zamknięta.")
-                st.rerun()
+        try:
+            sztuki = int(sztuki_str)
+        except ValueError:
+            messagebox.showerror("Błąd", "Liczba egzemplarzy musi być liczbą!")
+            return
 
-    with tab5:
-        st.subheader("Oczekujące i aktywne rezerwacje od czytelników")
-        df_rez = pd.read_sql('''
-            SELECT r.id, r.czytelnik, k.tytul as Książka, r.data_rezerwacji, r.status
-            FROM rezerwacje r JOIN ksiazki k ON r.ksiazka_id = k.id WHERE r.status IN ('Aktywna', 'Zaakceptowana', 'Oczekuje na zwrot')
-        ''', conn)
-        st.dataframe(df_rez, use_container_width=True, hide_index=True)
-        
-        if not df_rez.empty:
-            wyb_rez = st.selectbox("Wybierz rezerwację:", df_rez['id'].astype(str) + " - " + df_rez['czytelnik'] + " (" + df_rez['Książka'] + " - " + df_rez['status'] + ")")
-            rid = int(wyb_rez.split(" - ")[0])
-            
-            c.execute("SELECT status FROM rezerwacje WHERE id = ?", (rid,))
-            aktualny_status_rez = c.fetchone()[0]
-            
-            col_rz1, col_rz2, col_rz3 = st.columns(3)
-            with col_rz1:
-                if aktualny_status_rez == 'Aktywna':
-                    if st.button("✅ Zaakceptuj rezerwację (Wyślij komunikat do czytelnika)", type="primary"):
-                        c.execute("UPDATE rezerwacje SET status = 'Zaakceptowana' WHERE id = ?", (rid,))
-                        c.execute("UPDATE ksiazki SET stan = 'Zarezerwowana' WHERE id = (SELECT ksiazka_id FROM rezerwacje WHERE id = ?)", (rid,))
-                        conn.commit()
-                        st.success("Zaakceptowano rezerwację! Status książki zmieniony na 'Zarezerwowana'.")
-                        st.rerun()
-                else:
-                    st.info(f"Status rezerwacji: {aktualny_status_rez}")
-                    
-            with col_rz2:
-                if aktualny_status_rez in ('Aktywna', 'Zaakceptowana'):
-                    if st.button("📚 Przekształć w wypożyczenie"):
-                        c.execute("SELECT ksiazka_id, czytelnik FROM rezerwacje WHERE id = ?", (rid,))
-                        r_data = c.fetchone()
-                        kid, czytelnik_wyp = r_data[0], r_data[1]
-                        
-                        dzis = date.today()
-                        c.execute("SELECT wartosc FROM ustawienia WHERE klucz = 'czas_wypozyczenia'")
-                        def_dni = int(c.fetchone()[0])
-                        termin = dzis + timedelta(days=def_dni)
-                        
-                        c.execute("UPDATE ksiazki SET stan = 'Wypożyczona' WHERE id = ?", (kid,))
-                        c.execute("INSERT INTO wypozyczenia (ksiazka_id, czytelnik, data_wypozyczenia, data_zwrotu, status) VALUES (?, ?, ?, ?, ?)",
-                                  (kid, czytelnik_wyp, str(dzis), str(termin), 'Wypożyczona'))
-                        c.execute("UPDATE rezerwacje SET status = 'Oczekuje na zwrot' WHERE id = ?", (rid,))
-                        conn.commit()
-                        st.success("Wydano książkę czytelnikowi! Pozycja pozostanie na liście rezerwacji do momentu zwrotu.")
-                        st.rerun()
-                else:
-                    st.info("Książka jest obecnie wypożyczona. Zniknie z rezerwacji po przyjęciu zwrotu w zakładce Wypożyczenia.")
+        conn = sqlite3.connect("biblioteka.db")
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO Books (title, author, genre, barcode, available_copies) 
+            VALUES (?, ?, ?, ?, ?)
+        """,
+            (tytul, autor, gatunek, kod, sztuki),
+        )
+        conn.commit()
+        conn.close()
 
-            with col_rz3:
-                if st.button("❌ Odrzuć / Anuluj rezerwację"):
-                    c.execute("UPDATE ksiazki SET stan = 'Dostępna' WHERE id = (SELECT ksiazka_id FROM rezerwacje WHERE id = ?)", (rid,))
-                    c.execute("UPDATE rezerwacje SET status = 'Anulowana' WHERE id = ?", (rid,))
-                    conn.commit()
-                    st.warning("Anulowano rezerwację. Książka znów jest Dostępna.")
-                    st.rerun()
+        self.entry_tytul.delete(0, tk.END)
+        self.entry_autor.delete(0, tk.END)
+        self.entry_gatunek.delete(0, tk.END)
+        self.entry_kod_ksiazki.delete(0, tk.END)
+        self.entry_sztuki.delete(0, tk.END)
 
-    with tab6:
-        with st.form("form_settings"):
-            nowy_czas = st.number_input("Domyślny czas trwania wypożyczenia (w dniach):", min_value=1, value=14)
-            if st.form_submit_button("Zapisz ustawienia"):
-                c.execute("UPDATE ustawienia SET wartosc = ? WHERE klucz = 'czas_wypozyczenia'", (str(nowy_czas),))
-                conn.commit()
-                st.success("Zapisano ustawienia!")
+        messagebox.showinfo("Sukces", "Dodano książkę do bazy!")
+        self.odswiez_ksiazki()
 
-    with tab7:
-        st.subheader("📊 Podsumowanie i Statystyki Biblioteki")
-        c_s1, c_s2, c_s3 = st.columns(3)
-        with c_s1:
-            st.metric("Wszystkich książek", pd.read_sql("SELECT COUNT(*) FROM ksiazki", conn).iloc[0,0])
-        with c_s2:
-            st.metric("Zarejestrowanych czytelników", pd.read_sql("SELECT COUNT(*) FROM czytelnici", conn).iloc[0,0])
-        with c_s3:
-            st.metric("Aktywnych wypożyczeń", pd.read_sql("SELECT COUNT(*) FROM wypozyczenia WHERE status='Wypożyczona'", conn).iloc[0,0])
+    def usun_ksiazke(self):
+        wybrany = self.tabela_ksiazek.selection()
+        if not wybrany:
+            messagebox.showwarning("Uwaga", "Zaznacz książkę do usunięcia z listy!")
+            return
 
-# ==========================================
-# 2. KATALOG ONLINE OPAC (CZYTELNIK / ONLINE)
-# ==========================================
-else:
-    if "koszyk" not in st.session_state:
-        st.session_state["koszyk"] = []
-    if "czytelnik_zalogowany" not in st.session_state:
-        st.session_state["czytelnik_zalogowany"] = None
+        dane = self.tabela_ksiazek.item(wybrany)
+        book_id = dane["values"][0]
+        tytul_ksiazki = dane["values"][1]
 
-    col_logo, col_info, col_kontrast = st.columns([3, 5, 2])
-    with col_logo:
-        st.markdown("📖 **OPAC e-Biblioteka**")
-    with col_info:
-        if st.session_state["czytelnik_zalogowany"]:
-            st.markdown(f"Zalogowany: **{st.session_state['czytelnik_zalogowany']}**")
-        else:
-            st.markdown("⚠️ *Niezalogowany*")
-    with col_kontrast:
-        ile_w_koszyku = len(st.session_state["koszyk"])
-        st.markdown(f"📚 Półka: **{ile_w_koszyku}**")
+        if messagebox.askyesno(
+            "Potwierdzenie",
+            f"Czy na pewno chcesz usunąć książkę '{tytul_ksiazki}'?\n(Zostaną też usunięte powiązane wpisy o wypożyczeniach)",
+        ):
+            conn = sqlite3.connect("biblioteka.db")
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM Loans WHERE book_id = ?", (book_id,))
+            cursor.execute("DELETE FROM Books WHERE id = ?", (book_id,))
+            conn.commit()
+            conn.close()
 
-    st.divider()
+            messagebox.showinfo("Sukces", "Książka została usunięta z bazy.")
+            self.odswiez_ksiazki()
+            self.odswiez_wypozyczenia()
+            self.odswiez_czytelnikow()
 
-    menu_opac = st.radio("Menu:", ["Strona główna / Katalog", "Nowości", "Moja półka (Rezerwacje)", "Moje Konto / Rejestracja"], horizontal=True)
-    st.markdown("---")
+    def dodaj_czytelnika(self):
+        nazwa = self.entry_nazwa_czytelnika.get().strip()
+        kod_czytelnika = self.entry_kod_czytelnika_form.get().strip()
 
-    if menu_opac == "Strona główna / Katalog":
-        st.subheader("Wyszukaj książkę")
-        szuk_opac = st.text_input("Szukaj (tytuł, autor, rodzaj)...", key="sz_op")
-        
-        if szuk_opac:
-            q = "SELECT * FROM ksiazki WHERE tytul LIKE ? OR autor LIKE ? OR rodzaj LIKE ?"
-            df_kat = pd.read_sql(q, conn, params=(f"%{szukaj_opac}%", f"%{szukaj_opac}%", f"%{szukaj_opac}%"))
-        else:
-            df_kat = pd.read_sql("SELECT * FROM ksiazki", conn)
+        if not nazwa:
+            messagebox.showerror("Błąd", "Wpisz imię i nazwisko użytkownika!")
+            return
 
-        for index, row in df_kat.iterrows():
-            col_b1, col_b2 = st.columns([5, 2])
-            with col_b1:
-                st.markdown(f"**{row['tytul']}** — *{row['autor']}*")
-                st.caption(f"Rodzaj: {row['rodzaj']} | Stan: **{row['stan']}**")
-            with col_b2:
-                if row['stan'] == 'Dostępna':
-                    if st.button(f"Dodaj do półki", key=f"rez_{row['id']}"):
-                        if row['id'] not in st.session_state["koszyk"]:
-                            st.session_state["koszyk"].append(row['id'])
-                            st.success("Dodano do półki!")
-                            st.rerun()
-                elif row['stan'] == 'Zarezerwowana':
-                    st.info("🔒 Zarezerwowana")
-                else:
-                    st.warning("📚 Wypożyczona")
-            st.divider()
+        val_kod = kod_czytelnika if kod_czytelnika else None
 
-    elif menu_opac == "Nowości":
-        st.subheader("Ostatnio dodane nowości")
-        df_nowosci = pd.read_sql("SELECT tytul, autor, rodzaj, stan FROM ksiazki ORDER BY id DESC LIMIT 5", conn)
-        st.dataframe(df_nowosci, use_container_width=True, hide_index=True)
+        try:
+            conn = sqlite3.connect("biblioteka.db")
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO Users (name, barcode) VALUES (?, ?)", (nazwa, val_kod)
+            )
+            conn.commit()
+            conn.close()
 
-    elif menu_opac == "Moja półka (Rezerwacje)":
-        st.subheader("Twoja półka rezerwacji")
-        st.markdown(f"Liczba pozycji na półce: **{len(st.session_state['koszyk'])}**")
-        
-        if st.session_state["koszyk"]:
-            placeholders = ','.join(['?'] * len(st.session_state["koszyk"]))
-            df_koszyk = pd.read_sql(f"SELECT * FROM ksiazki WHERE id IN ({placeholders})", conn, params=tuple(st.session_state["koszyk"]))
-            st.dataframe(df_koszyk[['id', 'tytul', 'autor', 'stan']], use_container_width=True, hide_index=True)
-            
-            if st.button("Zarezerwuj wybrane pozycje"):
-                if st.session_state["czytelnik_zalogowany"]:
-                    for kid in st.session_state["koszyk"]:
-                        c.execute("SELECT stan FROM ksiazki WHERE id = ?", (kid,))
-                        aktualny_stan = c.fetchone()[0]
-                        if aktualny_stan == 'Dostępna':
-                            c.execute("INSERT INTO rezerwacje (ksiazka_id, czytelnik, data_rezerwacji, status) VALUES (?, ?, ?, ?)",
-                                      (kid, st.session_state["czytelnik_zalogowany"], str(date.today()), 'Aktywna'))
-                            c.execute("UPDATE ksiazki SET stan = 'Zarezerwowana' WHERE id = ?", (kid,))
-                    conn.commit()
-                    st.session_state["koszyk"] = []
-                    st.success("Rezerwacja została wysłana do bibliotekarza!")
-                    st.rerun()
-                else:
-                    st.error("❌ Musisz być zalogowany kodem, aby dokonać rezerwacji!")
-            
-            if st.button("Wyczyść półkę"):
-                st.session_state["koszyk"] = []
-                st.rerun()
-        else:
-            st.info("Twoja półka jest pusta.")
+            self.entry_nazwa_czytelnika.delete(0, tk.END)
+            self.entry_kod_czytelnika_form.delete(0, tk.END)
+            self.entry_szukaj_czytelnika.delete(0, tk.END)
 
-    elif menu_opac == "Moje Konto / Rejestracja":
-        st.subheader("Strefa Czytelnika")
-        tab_log, tab_reg = st.tabs(["🔑 Zaloguj się kodem", "📝 Zarejestruj nowe konto"])
-        
-        with tab_log:
-            if not st.session_state["czytelnik_zalogowany"]:
-                with st.form("form_log_czyt"):
-                    kod_wejscie = st.text_input("Wpisz swój unikalny identyfikator / kod karty:")
-                    if st.form_submit_button("Zaloguj się"):
-                        c.execute("SELECT imie_nazwisko FROM czytelnici WHERE kod_karty = ?", (kod_wejscie,))
-                        res = c.fetchone()
-                        if res:
-                            st.session_state["czytelnik_zalogowany"] = res[0]
-                            st.success(f"Witaj, {res[0]}!")
-                            st.rerun()
-                        else:
-                            st.error("Nie znaleziono czytelnika o takim kodzie.")
-            else:
-                st.write(f"Zalogowany użytkownik: **{st.session_state['czytelnik_zalogowany']}**")
-                
-                c.execute("SELECT k.tytul FROM rezerwacje r JOIN ksiazki k ON r.ksiazka_id = k.id WHERE r.czytelnik = ? AND r.status = 'Zaakceptowana'", (st.session_state["czytelnik_zalogowany"],))
-                zaakceptowane_rezerwacje = c.fetchall()
-                
-                if zaakceptowane_rezerwacje:
-                    st.success("🎉 **Twoja rezerwacja została zaakceptowana! Udaj się do biblioteki i odbierz swoje książki.**")
-                    tytuly_zaak = ", ".join([row[0] for row in zaakceptowane_rezerwacje])
-                    st.info(f"Dotyczy książek: **{tytuly_zaak}**")
+            messagebox.showinfo("Sukces", "Zarejestrowano nowego użytkownika!")
+            self.odswiez_czytelnikow()
+        except sqlite3.IntegrityError:
+            messagebox.showerror(
+                "Błąd", "Ten kod kreskowy / login jest już zajęty przez kogoś innego!"
+            )
+        except Exception as e:
+            messagebox.showerror("Błąd", f"Wystąpił problem: {e}")
 
-                st.markdown("#### Twoje aktywne wypożyczenia:")
-                df_w_cz = pd.read_sql("SELECT k.tytul, w.data_wypozyczenia, w.data_zwrotu FROM wypozyczenia w JOIN ksiazki k ON w.ksiazka_id = k.id WHERE w.czytelnik = ? AND w.status = 'Wypożyczona'", conn, params=(st.session_state["czytelnik_zalogowany"],))
-                st.dataframe(df_w_cz, use_container_width=True, hide_index=True)
+    def wypelnij_pola_czytelnika(self, event):
+        wybrany = self.tabela_czytelnikow.selection()
+        if not wybrany:
+            return
+        dane = self.tabela_czytelnikow.item(wybrany)
+        _, nazwa, kod, _ = dane["values"]
 
-                st.markdown("#### Twoje aktywne rezerwacje:")
-                df_r_cz = pd.read_sql("SELECT k.tytul, r.data_rezerwacji, r.status FROM rezerwacje r JOIN ksiazki k ON r.ksiazka_id = k.id WHERE r.czytelnik = ? AND r.status IN ('Aktywna', 'Zaakceptowana', 'Oczekuje na zwrot')", conn, params=(st.session_state["czytelnik_zalogowany"],))
-                st.dataframe(df_r_cz, use_container_width=True, hide_index=True)
-                
-                if st.button("Wyloguj z konta"):
-                    st.session_state["czytelnik_zalogowany"] = None
-                    st.rerun()
-                    
-        with tab_reg:
-            with st.form("form_reg_mobilna"):
-                nowe_imie = st.text_input("Twoje Imię i Nazwisko:")
-                nowy_kod = st.text_input("Wymyśl swój unikalny kod / PIN (np. 1234 lub własny identyfikator):")
-                if st.form_submit_button("Zarejestruj się"):
-                    if nowe_imie and nowy_kod:
-                        try:
-                            c.execute("INSERT INTO czytelnici (imie_nazwisko, kod_karty) VALUES (?, ?)", (nowe_imie, nowy_kod))
-                            conn.commit()
-                            st.success("Konto utworzone pomyślnie! Przejdź do zakładki logowania i wpisz swój kod.")
-                        except sqlite3.IntegrityError:
-                            st.error("❌ Ten kod/identyfikator jest już zajęty. Wybierz inny.")
-                    else:
-                        st.warning("Uzupełnij imię i kod.")
+        self.entry_nazwa_czytelnika.delete(0, tk.END)
+        self.entry_nazwa_czytelnika.insert(0, nazwa)
 
-    st.markdown("---")
-    st.caption("OPAC e-Biblioteka domowa — wersja 3.7")
+        self.entry_kod_czytelnika_form.delete(0, tk.END)
+        if kod != "-":
+            self.entry_kod_czytelnika_form.insert(0, kod)
+
+    def zapisz_edycje_czytelnika(self):
+        wybrany = self.tabela_czytelnikow.selection()
+        if not wybrany:
+            messagebox.showwarning(
+                "Uwaga", "Zaznacz użytkownika z listy, którego chcesz edytować!"
+            )
+            return
+
+        dane = self.tabela_czytelnikow.item(wybrany)
+        user_id = dane["values"][0]
+
+        nowa_nazwa = self.entry_nazwa_czytelnika.get().strip()
+        nowy_kod = self.entry_kod_czytelnika_form.get().strip()
+
+        if not nowa_nazwa:
+            messagebox.showerror("Błąd", "Imię i nazwisko nie może być puste!")
+            return
+
+        conn = sqlite3.connect("biblioteka.db")
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "UPDATE Users SET name = ?, barcode = ? WHERE id = ?",
+                (nowa_nazwa, nowy_kod if nowy_kod else None, user_id),
+            )
+            conn.commit()
+            messagebox.showinfo("Sukces", "Zaktualizowano dane użytkownika!")
+            self.entry_nazwa_czytelnika.delete(0, tk.END)
+            self.entry_kod_czytelnika_form.delete(0, tk.END)
+        except sqlite3.IntegrityError:
+            messagebox.showerror(
+                "Błąd", "Podany kod kreskowy / login jest już przypisany innej osobie!"
+            )
+        conn.close()
+        self.odswiez_czytelnikow()
+
+    def usun_czytelnika(self):
+        wybrany = self.tabela_czytelnikow.selection()
+        if not wybrany:
+            messagebox.showwarning("Uwaga", "Zaznacz użytkownika do usunięcia!")
+            return
+
+        dane = self.tabela_czytelnikow.item(wybrany)
+        user_id = dane["values"][0]
+        user_name = dane["values"][1]
+
+        if messagebox.askyesno(
+            "Potwierdzenie", f"Czy na pewno chcesz usunąć użytkownika {user_name}?"
+        ):
+            conn = sqlite3.connect("biblioteka.db")
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM Users WHERE id = ?", (user_id,))
+            conn.commit()
+            conn.close()
+
+            messagebox.showinfo("Sukces", "Użytkownik został usunięty.")
+            self.entry_nazwa_czytelnika.delete(0, tk.END)
+            self.entry_kod_czytelnika_form.delete(0, tk.END)
+            self.odswiez_czytelnikow()
+
+    def pokaz_karte_czytelnika(self):
+        wybrany = self.tabela_czytelnikow.selection()
+        if not wybrany:
+            messagebox.showwarning("Uwaga", "Zaznacz użytkownika z listy!")
+            return
+
+        dane = self.tabela_czytelnikow.item(wybrany)
+        user_id = dane["values"][0]
+        user_name = dane["values"][1]
+
+        conn = sqlite3.connect("biblioteka.db")
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT Books.title, Loans.borrow_date, Loans.due_date 
+            FROM Loans 
+            JOIN Books ON Loans.book_id = Books.id 
+            WHERE Loans.user_id = ?
+        """,
+            (user_id,),
+        )
+        wypozyczenia = cursor.fetchall()
+        conn.close()
+
+        okno_karta = tk.Toplevel(self.root)
+        okno_karta.title(f"Karta użytkownika: {user_name}")
+        okno_karta.geometry("450x350")
+
+        tk.Label(
+            okno_karta,
+            text=f"Karta Użytkownika\n{user_name}",
+            font=("Arial", 12, "bold"),
+            fg="#9C27B0",
+        ).pack(pady=10)
+
+        tk.Label(
+            okno_karta,
+            text=f"Aktywne wypożyczenia ({len(wypozyczenia)}):",
+            font=("Arial", 10, "bold"),
+        ).pack(anchor="w", padx=15)
+
+        frame_ksiazki = tk.Frame(okno_karta)
+        frame_ksiazki.pack(fill="both", expand=True, padx=15, pady=5)
+
+        tabela_karty = ttk.Treeview(
+            frame_ksiazki, columns=("Tytuł", "Od", "Do"), show="headings"
+        )
+        tabela_karty.heading("Tytuł", text="Książka")
+        tabela_karty.heading("Od", text="Wypożyczono")
+        tabela_karty.heading("Do", text="Termin zwrotu")
+
+        tabela_karty.column("Tytuł", width=220)
+        tabela_karty.column("Od", width=95, anchor="center")
+        tabela_karty.column("Do", width=95, anchor="center")
+        tabela_karty.pack(fill="both", expand=True)
+
+        for w in wypozyczenia:
+            tabela_karty.insert("", "end", values=(w[0], w[1], w[2]))
+
+    def otworz_okno_wypozyczenia(self):
+        wybrany = self.tabela_ksiazek.selection()
+        if not wybrany:
+            messagebox.showwarning("Uwaga", "Zaznacz najpierw książkę do wypożyczenia!")
+            return
+
+        dane = self.tabela_ksiazek.item(wybrany)
+        self.wybrana_ksiazka_id = dane["values"][0]
+        tytul_ksiazki = dane["values"][1]
+        dostepne = int(dane["values"][5])
+
+        if dostepne <= 0:
+            messagebox.showerror("Błąd", "Brak dostępnych egzemplarzy tej książki!")
+            return
+
+        conn = sqlite3.connect("biblioteka.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name FROM Users")
+        czytelnicy = cursor.fetchall()
+        conn.close()
+
+        if not czytelnicy:
+            messagebox.showerror("Błąd", "Brak zarejestrowanych użytkowników w bazie!")
+            return
+
+        okno_wyp = tk.Toplevel(self.root)
+        okno_wyp.title("Wypożycz książkę")
+        okno_wyp.geometry("350x380")
+
+        tk.Label(
+            okno_wyp,
+            text=f"Książka:\n{tytul_ksiazki}",
+            font=("Arial", 10, "bold"),
+            justify="center",
+        ).pack(pady=10)
+
+        tk.Label(okno_wyp, text="Wybierz użytkownika:").pack(anchor="w", padx=20)
+
+        self.wybrany_czytelnik = tk.StringVar()
+        opcje = [f"{u[0]} - {u[1]}" for u in czytelnicy]
+
+        combo = ttk.Combobox(
+            okno_wyp,
+            textvariable=self.wybrany_czytelnik,
+            values=opcje,
+            width=35,
+            state="readonly",
+        )
+        combo.pack(padx=20, pady=5)
